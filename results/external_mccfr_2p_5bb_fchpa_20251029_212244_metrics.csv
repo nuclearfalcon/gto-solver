@@ -1,0 +1,2 @@
+iteration,exploitability,time_elapsed,memory_mb,iters_per_sec,convergence_rate
+10000,64.27926601816053,10.185686349868774,107.78515625,981.7698735764461,

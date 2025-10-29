@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a GTO (Game Theory Optimal) poker training project that uses **OpenSpiel** (version 1.6.8) to simulate and analyze No-Limit Hold'em poker games. The project focuses on understanding poker game configurations, betting abstractions, and information state tensors for machine learning applications.
+This is a GTO (Game Theory Optimal) poker training project that uses **OpenSpiel** (version 1.6.8) to train and analyze No-Limit Hold'em poker policies using Counterfactual Regret Minimization (CFR) algorithms. The project provides a unified solver interface, sampled exploitability metrics, and comprehensive tools for GTO poker research.
 
 ## Python Environment
 
@@ -27,35 +27,158 @@ source ~/open_spiel/venv/bin/activate
 - **Python:** 3.10.12
 - **Key dependency:** `pyspiel` module (compiled C++ extension at `/home/nuclearfalcon/open_spiel/pyspiel.so`)
 
-## Running Tests
+## Common Commands
 
-This repository contains comprehensive test suites. All tests must be run with the OpenSpiel venv activated.
-
-### Run All Configuration Tests
+All commands require activating the OpenSpiel virtual environment first:
 ```bash
 source ~/open_spiel/venv/bin/activate
+```
+
+### Solving Poker Games
+
+**Solve a single game configuration:**
+```bash
+python solve_poker.py --config configs/2p_10bb_fcpa.json --algorithm cfr_plus --iterations 100000
+```
+
+**Compare multiple algorithms:**
+```bash
+python solve_and_compare.py --config configs/2p_10bb_fcpa.json --iterations 50000
+```
+
+**Query a trained policy:**
+```bash
+python query_policy.py --policy results/cfr_plus_policy.pkl --config configs/2p_10bb_fcpa.json
+```
+
+**Plot results:**
+```bash
+python plot_results.py results/cfr_plus_metrics.csv results/external_mccfr_metrics.csv
+```
+
+### Running Tests
+
+**Configuration tests** (asymmetrical stakes, betting abstractions, antes):
+```bash
 python test_poker_configs.py
 ```
 
-Tests: asymmetrical stakes, betting abstractions (fc/fcpa/fchpa/fullgame), ante simulations, and known limitations.
-
-### Run Tensor Analysis Tests
+**Tensor analysis tests** (18 assertions proving actual bet sizes stored in tensors):
 ```bash
-source ~/open_spiel/venv/bin/activate
 python test_tensor_bet_sizes.py
 ```
 
-**Critical test suite** proving that information state tensors store actual bet sizes even when using betting abstractions. Contains 18 assertions across 5 test categories.
-
-### Run Example Simulations
+**Memory tests** (verify no memory leaks in sampled exploitability):
 ```bash
-source ~/open_spiel/venv/bin/activate
+python test_memory_fix.py
+python test_memory_100_samples.py
+```
+
+**Validation tests** (compare sampled vs full exploitability):
+```bash
+python validate_exploitability_metrics.py
+```
+
+**Example simulations** (heads-up, 6-max, batch hands):
+```bash
 python holdem_example.py
 ```
 
-Demonstrates basic poker simulation: heads-up, 6-max, and batch hand simulation.
-
 ## Core Architecture
+
+**CRITICAL:** This codebase follows the **Single Source of Truth (SSOT)** principle. Each major component has exactly ONE authoritative implementation. See `ARCHITECTURE.md` for complete documentation.
+
+### Single Sources of Truth
+
+| Component | Module | Description |
+|-----------|--------|-------------|
+| **Solving** | `poker_solver.py` → `UnifiedPokerSolver` | Unified interface for 8 CFR algorithms |
+| **Exploitability** | `exploitability_metrics.py` → `SampledExploitabilityCalculator` | Memory-efficient Monte Carlo exploitability |
+| **Configuration** | `game_config.py` → `PokerGameConfig` | JSON-based game configuration |
+| **Metrics** | `solver_metrics.py` → `MetricsTracker`, `AdaptiveSchedule` | Track solving progress |
+| **Logging** | `solver_logger.py` → `SolverLogger` | Standardized console output |
+| **Test Utils** | `test_utils.py` | Memory monitoring and test helpers |
+
+**Always use these modules. Never access OpenSpiel APIs directly or duplicate functionality.**
+
+### Unified Solver Interface
+
+`UnifiedPokerSolver` provides a single interface for all CFR algorithms:
+
+```python
+from poker_solver import UnifiedPokerSolver
+from game_config import PokerGameConfig
+
+# Load configuration
+config = PokerGameConfig.from_json("configs/2p_10bb_fcpa.json")
+
+# Create solver with algorithm choice
+solver = UnifiedPokerSolver(config, algorithm='cfr_plus')
+
+# Solve with adaptive exploitability checking (uses sampled exploitability by default)
+solver.solve(
+    max_iterations=100_000,
+    adaptive_schedule=AdaptiveSchedule(),  # 50k, 100k, 250k intervals
+    checkpoint_interval=10_000
+    # use_sampled_exploitability=True  # DEFAULT - memory-safe
+)
+
+# Get results
+policy = solver.get_average_policy()
+# Exploitability is already calculated during solve using sampled method
+# Can also calculate manually:
+sampled = solver.calculate_sampled_exploitability()  # Fast, memory-safe (DEFAULT)
+```
+
+**Supported algorithms:** `vanilla_cfr`, `cfr_plus`, `dcfr`, `lcfr`, `external_mccfr`, `outcome_mccfr`, `cpp_cfr`, `cpp_cfr_plus`
+
+### Sampled Exploitability (DEFAULT)
+
+**CRITICAL:** Sampled exploitability is now the **DEFAULT** for all solving. Full exploitability causes massive memory usage and should NEVER be used except for tiny test games.
+
+```python
+from exploitability_metrics import SampledExploitabilityCalculator
+
+calc = SampledExploitabilityCalculator(game, policy)
+result = calc.calculate(
+    confidence_level=0.99,   # 99% confidence interval
+    max_ci_width=0.05,       # Stop when CI width < 5% (default for periodic checks)
+    min_samples=50,          # Minimum before checking convergence
+    max_samples=500          # Memory-safe upper bound (realistic for full Hold'em)
+)
+# Returns: {'exploitability': float, 'ci_lower': float, 'ci_upper': float, 'num_samples': int}
+```
+
+**Key features:**
+- **DEFAULT METHOD** - used automatically during solving
+- Streaming statistics (Welford's algorithm) - no memory accumulation
+- Adaptive sampling stops when CI is narrow enough
+- Automatic garbage collection every 50 samples
+- During solve: uses 5% CI width target with 50-500 samples (fast periodic checks, ~2-5 min for full Hold'em)
+- Final measurement: uses 0.5% CI width target with 500-5000 samples (high accuracy, ~20-50 min)
+- Each sample requires computing exact best response for one random card deal
+
+### Game Configuration Pattern
+
+**Always use `PokerGameConfig` for consistency:**
+
+```python
+from game_config import PokerGameConfig
+
+# Load from JSON
+config = PokerGameConfig.from_json("configs/2p_10bb_fcpa.json")
+game = config.create_game()
+
+# Or create programmatically
+config = PokerGameConfig(
+    num_players=2,
+    stack_sizes=[1000, 1000],
+    blinds=[50, 100],
+    betting_abstraction='fcpa'
+)
+```
+
+Configurations are stored in `configs/` directory with naming convention: `{players}p_{stacksize}bb_{abstraction}.json`
 
 ### OpenSpiel's `universal_poker` Game
 
@@ -159,22 +282,57 @@ There is **no separate ante parameter**. Simulate antes using the `blind` parame
 - **Antes:** No dedicated parameter; must use blind workaround.
 - **Max players:** 10 (hardcoded in OpenSpiel)
 
-## File Organization
+## Key Files
 
-- **`holdem_example.py`**: Basic examples showing how to create games and simulate hands
-- **`test_poker_configs.py`**: Comprehensive test suite for game configurations (asymmetric stacks, abstractions, antes, limitations)
-- **`test_tensor_bet_sizes.py`**: Detailed test suite proving that actual bet sizes are stored in tensors (18 test assertions)
-- **`README.md`**: User-facing documentation with quick start guide and parameter reference
+**Main Scripts:**
+- `solve_poker.py` - Single algorithm solver with checkpointing and metrics
+- `solve_and_compare.py` - Compare multiple CFR algorithms side-by-side
+- `query_policy.py` - Interactive policy queries for trained models
+- `plot_results.py` - Visualize convergence curves
 
-## Development Notes
+**Core Modules (SSOT):**
+- `poker_solver.py` - Unified solver interface
+- `exploitability_metrics.py` - Sampled exploitability calculation
+- `game_config.py` - Game configuration management
+- `solver_metrics.py` - Metrics tracking and adaptive schedules
+- `solver_logger.py` - Standardized logging
+- `test_utils.py` - Test utilities (memory monitoring, etc.)
 
-### Adding New Tests
+**Test Suites:**
+- `test_poker_configs.py` - Game configuration validation
+- `test_tensor_bet_sizes.py` - Tensor structure verification (18 assertions)
+- `test_memory_*.py` - Memory leak detection
+- `validate_exploitability_metrics.py` - Ground truth comparison
 
-When creating new test scripts:
-1. Always include the shebang and virtual environment activation reminder in the docstring
-2. Use `pyspiel.load_game('universal_poker', config_dict)` pattern
-3. Handle both chance nodes and decision nodes in simulation loops
-4. Test assertions should verify specific behaviors (see `test_tensor_bet_sizes.py` for examples)
+**Supporting:**
+- `betting_abstraction.py` - Betting abstraction utilities
+- `holdem_example.py` - Basic simulation examples
+
+## Development Guidelines
+
+### Writing New Code
+
+**DO:**
+- Import from SSOT modules (`poker_solver`, `exploitability_metrics`, etc.)
+- Use `PokerGameConfig` for all game creation
+- Use `test_utils` for memory monitoring in tests
+- Follow the command patterns in existing scripts
+
+**DON'T:**
+- Use full exploitability (causes massive memory usage - sampled is now DEFAULT)
+- Access OpenSpiel APIs directly (e.g., `exploitability.nash_conv()`)
+- Duplicate utility functions (use `test_utils.py`)
+- Hardcode game parameters (use `PokerGameConfig`)
+- Create custom solver wrappers
+- Pass `--use-full-exploitability` flag unless testing tiny toy games
+
+### Adding Tests
+
+New test scripts should:
+1. Include virtual environment activation reminder in docstring
+2. Use `test_utils` for memory monitoring
+3. Import from SSOT modules, not OpenSpiel directly
+4. Handle both chance nodes and decision nodes in simulation loops
 
 ### Parameter Types
 
@@ -197,9 +355,32 @@ state.history()                  # List of all actions taken
 state.information_state_tensor() # Full tensor representation
 ```
 
-### External Resources
+## Output Directory Structure
+
+Solver outputs are saved to organized directories:
+
+```
+results/                    # Solver results and metrics
+├── cfr_plus_2p_10bb_20250129_143022_metrics.csv
+├── cfr_plus_2p_10bb_20250129_143022_summary.json
+└── cfr_plus_2p_10bb_20250129_143022_policy.pkl
+
+checkpoints/                # Intermediate solver checkpoints
+├── cfr_plus_iter_10000.pkl
+├── cfr_plus_iter_20000.pkl
+└── ...
+
+configs/                    # Game configurations (JSON)
+├── 2p_5bb_fchpa_tiny.json
+├── 2p_10bb_fcpa.json
+└── ...
+```
+
+**Naming convention:** `{algorithm}_{game_description}_{timestamp}_{type}.{ext}`
+
+## External Resources
 
 - OpenSpiel installation: `/home/nuclearfalcon/open_spiel`
-- OpenSpiel source code: `/home/nuclearfalcon/open_spiel/open_spiel/games/universal_poker/`
-- Universal poker implementation: `universal_poker.cc` and `universal_poker.h`
-- Test examples: `/home/nuclearfalcon/open_spiel/open_spiel/games/universal_poker/universal_poker_test.cc`
+- OpenSpiel source: `/home/nuclearfalcon/open_spiel/open_spiel/games/universal_poker/`
+- Architecture documentation: `ARCHITECTURE.md` (comprehensive SSOT guide)
+- Solving guide: `SOLVING_GUIDE.md` (if exists)

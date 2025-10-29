@@ -561,6 +561,154 @@ def test_5_detailed_tensor_walkthrough():
     return passed == total
 
 
+def test_6_custom_abstraction_bet_sizes():
+    """Test 6: Verify bet sizes stored with custom abstraction (fullgame + filtering)"""
+    print_test_header(6, "Custom Betting Abstraction (Fullgame + Filtering)")
+
+    print("\nThis test verifies that when using fullgame + filtering for custom")
+    print("abstraction (FCHPA + 1.5×pot), the actual bet sizes are still stored.")
+
+    game = pyspiel.load_game('universal_poker', {
+        'bettingAbstraction': 'fullgame',  # No hardcoded abstraction
+        'numRanks': 4,
+        'numSuits': 1,
+        'numPlayers': 2,
+        'numRounds': 1,
+        'blind': '50 100',
+        'firstPlayer': '2',
+        'numHoleCards': 1,
+        'numBoardCards': '0',
+        'stack': '1000 1000'
+    })
+
+    # Create state
+    state = game.new_initial_state()
+    state = state.child(1)  # Deal first card
+    state = state.child(2)  # Deal second card
+
+    analyzer = TensorAnalyzer(game, state)
+
+    print(f"\nGame configuration:")
+    print(f"  Betting abstraction: fullgame (with custom filtering)")
+    print(f"  Max game length: {game.max_game_length()}")
+
+    # Calculate custom bet sizes
+    pot = 150  # 50 + 100 blinds
+    half_pot = pot // 2  # 75
+    full_pot = pot  # 150
+    one_half_pot = int(pot * 1.5)  # 225
+    max_stack = 1000
+    tolerance = 10
+
+    print(f"\nCustom abstraction bet sizes:")
+    print(f"  Half pot (0.5×): ~{half_pot}")
+    print(f"  Full pot (1.0×): ~{full_pot}")
+    print(f"  One-and-half pot (1.5×): ~{one_half_pot}")
+    print(f"  All-in: {max_stack}")
+
+    # Filter actions - find closest action to each target bet size
+    legal_actions = state.legal_actions()
+    target_bets = [half_pot, full_pot, one_half_pot, max_stack]
+
+    filtered_actions = []
+
+    # Always include fold and call
+    for action in legal_actions:
+        if action <= 1:
+            filtered_actions.append(action)
+
+    # For each target bet size, find the closest legal action
+    bet_actions = [a for a in legal_actions if a > 1]
+
+    for target in target_bets:
+        if bet_actions:
+            # Find closest action to this target
+            closest = min(bet_actions, key=lambda a: abs(a - target))
+            if closest not in filtered_actions:
+                filtered_actions.append(closest)
+
+    filtered_actions.sort()
+
+    print(f"\nFiltered to {len(filtered_actions)} actions: {filtered_actions}")
+
+    passed = 0
+    total = 0
+
+    # Test that filtered actions store bet sizes
+    test_actions = [
+        (a, f"Filtered action {a}")
+        for a in filtered_actions if a > 1  # Skip fold and call
+    ]
+
+    for action, description in test_actions[:4]:  # Test first 4 bet actions
+        print(f"\n--- Testing: {description} ---")
+
+        next_state = state.child(action)
+        tensor = next_state.information_state_tensor()
+        bet_sizes = analyzer.find_bet_sizes(tensor)
+        non_zero = [x for x in bet_sizes if x > 0]
+
+        print(f"  Non-zero bet sizes in tensor: {non_zero}")
+
+        total += 1
+        if assert_test(float(action) in bet_sizes,
+                      f"Bet size {action} found in tensor",
+                      f"Expected {action}, found: {non_zero}"):
+            passed += 1
+
+    # Test that different filtered bet sizes produce different tensors
+    total += 1
+    if len(filtered_actions) >= 4:
+        # Get two different bet actions
+        bet_actions = [a for a in filtered_actions if a > 1]
+        if len(bet_actions) >= 2:
+            action1, action2 = bet_actions[0], bet_actions[1]
+            tensor1 = state.child(action1).information_state_tensor()
+            tensor2 = state.child(action2).information_state_tensor()
+
+            sizes1 = analyzer.find_bet_sizes(tensor1)
+            sizes2 = analyzer.find_bet_sizes(tensor2)
+
+            if assert_test(sizes1 != sizes2,
+                          "Different filtered bets produce different tensor sizes",
+                          f"Action {action1} vs {action2}"):
+                passed += 1
+        else:
+            print("  ⊘ SKIP: Not enough bet actions to compare")
+    else:
+        print("  ⊘ SKIP: Not enough filtered actions")
+
+    # Verify 1.5× pot bet stores correct size
+    total += 1
+    # Find the action closest to 1.5x pot (should be in filtered_actions)
+    one_half_pot_action = None
+    bet_actions_filtered = [a for a in filtered_actions if a > 1]
+    if bet_actions_filtered:
+        # Find which one is closest to our 1.5x pot target
+        closest_to_1_5x = min(bet_actions_filtered, key=lambda a: abs(a - one_half_pot))
+        if closest_to_1_5x != max_stack:  # Make sure it's not the all-in
+            one_half_pot_action = closest_to_1_5x
+
+    if one_half_pot_action:
+        next_state = state.child(one_half_pot_action)
+        tensor = next_state.information_state_tensor()
+        bet_sizes = analyzer.find_bet_sizes(tensor)
+
+        if assert_test(float(one_half_pot_action) in bet_sizes,
+                      f"1.5× pot bet ({one_half_pot_action}) stores actual size",
+                      f"Found {one_half_pot_action} in tensor"):
+            passed += 1
+    else:
+        print("  ⊘ SKIP: 1.5× pot action not available")
+        total -= 1  # Don't count this test
+
+    print(f"\n{'='*70}")
+    print(f"  TEST 6 RESULTS: {passed}/{total} assertions passed")
+    print('='*70)
+
+    return passed == total
+
+
 def main():
     """Run all tests"""
     print("="*70)
@@ -578,6 +726,7 @@ def main():
         ("Side-by-Side Comparison", test_3_compare_bet_sizes_side_by_side),
         ("Abstraction vs Sizing", test_4_abstraction_vs_sizing),
         ("Detailed Walkthrough", test_5_detailed_tensor_walkthrough),
+        ("Custom Abstraction Bet Sizes", test_6_custom_abstraction_bet_sizes),
     ]
 
     for test_name, test_func in tests:

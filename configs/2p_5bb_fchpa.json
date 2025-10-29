@@ -1,0 +1,14 @@
+{
+  "num_players": 2,
+  "stack_sizes": [500, 500],
+  "blinds": [100, 50],
+  "betting_abstraction": "fchpa",
+  "num_rounds": 4,
+  "num_suits": 4,
+  "num_ranks": 13,
+  "num_hole_cards": 2,
+  "num_board_cards": "0 3 1 1",
+  "first_player": "2 1 1 1",
+  "betting_type": "nolimit",
+  "description": "2-player 5BB heads-up NLHE with FCHPA (validation config)"
+}

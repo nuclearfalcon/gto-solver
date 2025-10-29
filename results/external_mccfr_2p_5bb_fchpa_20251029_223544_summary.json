@@ -1,0 +1,12 @@
+{
+  "algorithm": "External Sampling MCCFR",
+  "game_description": "PokerGameConfig(2p, 5.0BB, fchpa)",
+  "total_iterations": 100000,
+  "total_time": 1332.3350276947021,
+  "final_exploitability": 65.38458417214157,
+  "initial_exploitability": 56.185745368657486,
+  "min_exploitability": 56.185745368657486,
+  "avg_iters_per_sec": 83.10883439361197,
+  "peak_memory_mb": 108.5625,
+  "num_checkpoints": 11
+}

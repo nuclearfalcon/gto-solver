@@ -1,0 +1,12 @@
+{
+  "algorithm": "C++ CFR+",
+  "game_description": "PokerGameConfig(2p, 5.0BB, fchpa)",
+  "total_iterations": 10000,
+  "total_time": 180.94093012809753,
+  "final_exploitability": 57.38692665219455,
+  "initial_exploitability": 57.38692665219455,
+  "min_exploitability": 57.38692665219455,
+  "avg_iters_per_sec": 55.26665521681843,
+  "peak_memory_mb": 107.70703125,
+  "num_checkpoints": 1
+}

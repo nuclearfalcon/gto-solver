@@ -32,17 +32,12 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    # Config source (mutually exclusive)
-    config_group = parser.add_mutually_exclusive_group(required=True)
-    config_group.add_argument(
+    # Config source
+    parser.add_argument(
         '--config',
         type=str,
+        required=True,
         help='Path to game configuration JSON file'
-    )
-    config_group.add_argument(
-        '--resume',
-        type=str,
-        help='Path to checkpoint file to resume from'
     )
 
     # Algorithm selection
@@ -74,6 +69,17 @@ def parse_args():
         type=str,
         default='checkpoints',
         help='Directory to save checkpoints (default: checkpoints/)'
+    )
+    parser.add_argument(
+        '--checkpoint-prefix',
+        type=str,
+        default=None,
+        help='Prefix for checkpoint filenames (default: auto-generated from algorithm and config)'
+    )
+    parser.add_argument(
+        '--force-restart',
+        action='store_true',
+        help='Force restart from iteration 0, ignoring any existing checkpoints'
     )
 
     # Output
@@ -183,6 +189,33 @@ def parse_args():
         default=0.6,
         help='Outcome Sampling MCCFR epsilon parameter (default: 0.6)'
     )
+    parser.add_argument(
+        '--average-type',
+        type=str,
+        default='SIMPLE',
+        choices=['SIMPLE', 'FULL'],
+        help='External MCCFR averaging type: SIMPLE (default, faster) or FULL (better for 3+ players)'
+    )
+
+    # LCFR-ES specific parameters
+    parser.add_argument(
+        '--lcfr-gamma',
+        type=float,
+        default=1.0,
+        help='LCFR-ES gamma parameter: iteration weighting for averaging (default: 1.0 = linear)'
+    )
+    parser.add_argument(
+        '--lcfr-alpha',
+        type=float,
+        default=None,
+        help='LCFR-ES alpha parameter: positive regret discounting (default: None = no discounting)'
+    )
+    parser.add_argument(
+        '--lcfr-beta',
+        type=float,
+        default=None,
+        help='LCFR-ES beta parameter: negative regret discounting (default: None = no discounting)'
+    )
 
     return parser.parse_args()
 
@@ -191,23 +224,15 @@ def main():
     """Main entry point."""
     args = parse_args()
 
-    # Load or create game configuration
-    if args.resume:
-        print(f"Resuming from checkpoint: {args.resume}")
-        print("Note: Game configuration will be loaded from checkpoint")
-        # For simplicity, require --config even when resuming
-        print("ERROR: Resume functionality requires specifying --config as well")
-        print("This is a design limitation - checkpoints don't store game config")
+    # Load game configuration
+    try:
+        game_config = PokerGameConfig.from_json(args.config)
+        print(f"Loaded game configuration: {game_config}")
+    except Exception as e:
+        print(f"ERROR: Failed to load config from {args.config}: {e}")
         return 1
-    else:
-        try:
-            game_config = PokerGameConfig.from_json(args.config)
-            print(f"Loaded game configuration: {game_config}")
-        except Exception as e:
-            print(f"ERROR: Failed to load config from {args.config}: {e}")
-            return 1
 
-    # Create solver
+    # Create algorithm_kwargs based on algorithm
     algorithm_kwargs = {}
     if args.algorithm == 'dcfr':
         algorithm_kwargs = {
@@ -217,6 +242,14 @@ def main():
         }
     elif args.algorithm == 'outcome_mccfr':
         algorithm_kwargs = {'epsilon': args.epsilon}
+    elif args.algorithm == 'external_mccfr':
+        algorithm_kwargs = {'average_type': args.average_type}
+    elif args.algorithm == 'lcfr_es':
+        algorithm_kwargs = {
+            'gamma': args.lcfr_gamma,
+            'alpha': args.lcfr_alpha,
+            'beta': args.lcfr_beta
+        }
 
     try:
         solver = UnifiedPokerSolver(
@@ -227,6 +260,35 @@ def main():
     except Exception as e:
         print(f"ERROR: Failed to create solver: {e}")
         return 1
+
+    # Generate checkpoint prefix if not provided
+    if args.checkpoint_prefix is None:
+        # Auto-generate from algorithm and config
+        checkpoint_prefix = f"{args.algorithm}_{game_config.get_short_description()}"
+    else:
+        checkpoint_prefix = args.checkpoint_prefix
+
+    # Auto-resume from checkpoint if exists (unless --force-restart)
+    if not args.force_restart and args.checkpoint_interval:
+        latest_checkpoint = UnifiedPokerSolver.find_latest_checkpoint(
+            args.checkpoint_dir,
+            checkpoint_prefix
+        )
+        if latest_checkpoint:
+            print(f"\n{'='*60}")
+            print(f"Found existing checkpoint: {latest_checkpoint}")
+            print(f"Resuming from checkpoint...")
+            print(f"{'='*60}\n")
+            try:
+                solver.load_checkpoint(latest_checkpoint)
+            except Exception as e:
+                print(f"WARNING: Failed to load checkpoint: {e}")
+                print("Starting from scratch instead...")
+        else:
+            print(f"No existing checkpoints found with prefix: {checkpoint_prefix}")
+            print("Starting from scratch...")
+    elif args.force_restart:
+        print("Force restart enabled - ignoring any existing checkpoints")
 
     # Create adaptive schedule
     if args.check_exploitability == 'adaptive':
@@ -246,6 +308,7 @@ def main():
             adaptive_schedule=schedule,
             checkpoint_interval=args.checkpoint_interval,
             checkpoint_dir=args.checkpoint_dir,
+            checkpoint_prefix=checkpoint_prefix,
             progress_interval=args.progress_interval,
             skip_initial_exploitability=args.skip_initial_check,
             use_sampled_exploitability=not args.use_full_exploitability,  # Default: True (sampled)

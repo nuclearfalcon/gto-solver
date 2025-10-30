@@ -47,6 +47,7 @@ from exploitability_metrics import (
     SampledExploitabilityCalculator,
     format_exploitability_report
 )
+from linear_external_mccfr import LinearExternalSamplingSolver
 
 
 class UnifiedPokerSolver:
@@ -61,7 +62,9 @@ class UnifiedPokerSolver:
         'cfr_plus': 'Python CFR+',
         'dcfr': 'Python Discounted CFR',
         'lcfr': 'Python Linear CFR',
-        'external_mccfr': 'External Sampling MCCFR',
+        'external_mccfr': 'External Sampling MCCFR (SIMPLE averaging)',
+        'external_mccfr_full': 'External Sampling MCCFR (FULL averaging)',
+        'lcfr_es': 'Linear-Weighted External Sampling MCCFR (LCFR-ES)',
         'outcome_mccfr': 'Outcome Sampling MCCFR',
         'cpp_cfr': 'C++ CFR',
         'cpp_cfr_plus': 'C++ CFR+',
@@ -136,9 +139,34 @@ class UnifiedPokerSolver:
             return discounted_cfr.LCFRSolver(self.game)
 
         elif self.algorithm == 'external_mccfr':
+            # Support both 'SIMPLE' and 'FULL' averaging types
+            average_type_str = self.algorithm_kwargs.get('average_type', 'SIMPLE')
+            if average_type_str == 'FULL':
+                avg_type = external_sampling_mccfr.AverageType.FULL
+            else:
+                avg_type = external_sampling_mccfr.AverageType.SIMPLE
             return external_sampling_mccfr.ExternalSamplingSolver(
                 self.game,
-                average_type=external_sampling_mccfr.AverageType.SIMPLE
+                average_type=avg_type
+            )
+
+        elif self.algorithm == 'external_mccfr_full':
+            # Alias for external_mccfr with FULL averaging
+            return external_sampling_mccfr.ExternalSamplingSolver(
+                self.game,
+                average_type=external_sampling_mccfr.AverageType.FULL
+            )
+
+        elif self.algorithm == 'lcfr_es':
+            # Linear-Weighted External Sampling MCCFR
+            gamma = self.algorithm_kwargs.get('gamma', 1.0)
+            alpha = self.algorithm_kwargs.get('alpha', None)
+            beta = self.algorithm_kwargs.get('beta', None)
+            return LinearExternalSamplingSolver(
+                self.game,
+                gamma=gamma,
+                alpha=alpha,
+                beta=beta
             )
 
         elif self.algorithm == 'outcome_mccfr':
@@ -159,7 +187,7 @@ class UnifiedPokerSolver:
 
     def _run_iteration(self):
         """Run a single iteration of the algorithm."""
-        if self.algorithm in ['external_mccfr', 'outcome_mccfr']:
+        if self.algorithm in ['external_mccfr', 'external_mccfr_full', 'lcfr_es', 'outcome_mccfr']:
             # MCCFR uses iteration() method
             self.solver.iteration()
         else:
@@ -275,6 +303,7 @@ class UnifiedPokerSolver:
         adaptive_schedule: Optional[AdaptiveSchedule] = None,
         checkpoint_interval: Optional[int] = None,
         checkpoint_dir: str = "checkpoints",
+        checkpoint_prefix: Optional[str] = None,
         progress_interval: int = 100,
         skip_initial_exploitability: bool = False,
         use_sampled_exploitability: bool = True,
@@ -293,6 +322,8 @@ class UnifiedPokerSolver:
                               (default: 50k/100k/250k schedule)
             checkpoint_interval: Save checkpoint every N iterations (None = no checkpoints)
             checkpoint_dir: Directory to save checkpoints
+            checkpoint_prefix: Prefix for checkpoint filenames (default: algorithm name)
+                             Used for auto-resume: checkpoints with same prefix can be resumed
             progress_interval: Show progress update every N iterations (default: 100)
             skip_initial_exploitability: Skip initial exploitability check (saves memory for large games)
             use_sampled_exploitability: Use memory-safe sampled exploitability during solve loop (default: True, RECOMMENDED)
@@ -433,7 +464,7 @@ class UnifiedPokerSolver:
 
             # Save checkpoint if requested
             if checkpoint_interval and self.current_iteration % checkpoint_interval == 0:
-                checkpoint_path = self._save_checkpoint(checkpoint_dir)
+                checkpoint_path = self._save_checkpoint(checkpoint_dir, checkpoint_prefix)
                 self.logger.log_checkpoint_save(self.current_iteration, checkpoint_path)
 
         # Final exploitability check
@@ -519,24 +550,40 @@ class UnifiedPokerSolver:
 
         self.logger.log_info(f"Policy saved to: {policy_path}")
 
-    def _save_checkpoint(self, checkpoint_dir: str) -> str:
+    def _save_checkpoint(self, checkpoint_dir: str, checkpoint_prefix: Optional[str] = None) -> str:
         """
         Save solver checkpoint.
 
         Args:
             checkpoint_dir: Directory to save checkpoint
+            checkpoint_prefix: Optional prefix for checkpoint filename (default: algorithm name)
 
         Returns:
             Path to saved checkpoint
         """
         Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
+        # Use prefix or default to algorithm name
+        if checkpoint_prefix is None:
+            prefix = self.algorithm
+        else:
+            prefix = checkpoint_prefix
+
         checkpoint_path = (
-            f"{checkpoint_dir}/{self.algorithm}_iter_{self.current_iteration}.pkl"
+            f"{checkpoint_dir}/{prefix}_iter_{self.current_iteration}.pkl"
         )
 
+        # Save both solver and current iteration
+        checkpoint_data = {
+            'solver': self.solver,
+            'current_iteration': self.current_iteration,
+            'algorithm': self.algorithm,
+            'game_config': self.game_config,
+            'algorithm_kwargs': self.algorithm_kwargs
+        }
+
         with open(checkpoint_path, 'wb') as f:
-            pickle.dump(self.solver, f, pickle.HIGHEST_PROTOCOL)
+            pickle.dump(checkpoint_data, f, pickle.HIGHEST_PROTOCOL)
 
         return checkpoint_path
 
@@ -548,9 +595,62 @@ class UnifiedPokerSolver:
             checkpoint_path: Path to checkpoint file
         """
         with open(checkpoint_path, 'rb') as f:
-            self.solver = pickle.load(f)
+            data = pickle.load(f)
 
-        self.logger.log_info(f"Loaded checkpoint from: {checkpoint_path}")
+        # Handle both old format (just solver) and new format (dict with metadata)
+        if isinstance(data, dict) and 'solver' in data:
+            self.solver = data['solver']
+            self.current_iteration = data.get('current_iteration', 0)
+            self.logger.log_info(f"Loaded checkpoint from: {checkpoint_path}")
+            self.logger.log_info(f"Resuming from iteration: {self.current_iteration:,}")
+        else:
+            # Old format - just the solver object
+            self.solver = data
+            # Try to extract iteration from filename
+            import re
+            match = re.search(r'iter_(\d+)', checkpoint_path)
+            if match:
+                self.current_iteration = int(match.group(1))
+                self.logger.log_info(f"Loaded checkpoint from: {checkpoint_path}")
+                self.logger.log_info(f"Resuming from iteration: {self.current_iteration:,} (extracted from filename)")
+            else:
+                self.logger.log_warning(f"Could not determine iteration from checkpoint filename: {checkpoint_path}")
+                self.current_iteration = 0
+
+    @classmethod
+    def find_latest_checkpoint(cls, checkpoint_dir: str, checkpoint_prefix: str) -> Optional[str]:
+        """
+        Find the latest checkpoint file matching the given prefix.
+
+        Args:
+            checkpoint_dir: Directory containing checkpoints
+            checkpoint_prefix: Prefix to match (e.g., 'cfr_plus_3p_kuhn')
+
+        Returns:
+            Path to latest checkpoint, or None if not found
+        """
+        import glob
+        import re
+
+        checkpoint_pattern = f"{checkpoint_dir}/{checkpoint_prefix}_iter_*.pkl"
+        matching_files = glob.glob(checkpoint_pattern)
+
+        if not matching_files:
+            return None
+
+        # Extract iteration numbers and find the maximum
+        max_iter = -1
+        latest_file = None
+
+        for filepath in matching_files:
+            match = re.search(r'iter_(\d+)\.pkl$', filepath)
+            if match:
+                iteration = int(match.group(1))
+                if iteration > max_iter:
+                    max_iter = iteration
+                    latest_file = filepath
+
+        return latest_file
 
     @classmethod
     def get_algorithm_description(cls, algorithm: str) -> str:

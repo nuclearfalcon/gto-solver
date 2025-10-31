@@ -111,7 +111,8 @@ def worker_run_solver(
     checkpoint_prefix: str,
     csv_path: str,
     progress_queue: Queue,
-    worker_id: int
+    worker_id: int,
+    throttle_delay: float = 0.0
 ) -> Dict[str, Any]:
     """
     Worker function that runs a single solver in a separate process.
@@ -129,6 +130,7 @@ def worker_run_solver(
         csv_path: Path to shared CSV file
         progress_queue: Queue for sending progress updates to main process
         worker_id: Unique worker ID for logging
+        throttle_delay: Seconds to sleep after each exploitability check (thermal control)
 
     Returns:
         Dict with final metrics and status
@@ -234,6 +236,10 @@ def worker_run_solver(
                     'min_nash_iteration': min_nash_iteration,
                     'type': 'exploitability'
                 })
+
+                # Thermal throttling: sleep after exploitability check to reduce CPU heat
+                if throttle_delay > 0:
+                    time.sleep(throttle_delay)
 
             # Save checkpoints
             if checkpoint_interval and iteration > 0 and iteration % checkpoint_interval == 0:
@@ -417,7 +423,8 @@ class ParallelResearchValidationRunner:
         checkpoint_prefix: str = None,
         output_dir: str = "results",
         force_restart: bool = False,
-        max_workers: int = None
+        max_workers: int = None,
+        throttle_delay: float = 0.0
     ):
         """Initialize parallel research validation runner."""
         self.iterations = iterations
@@ -427,6 +434,7 @@ class ParallelResearchValidationRunner:
         self.checkpoint_dir = checkpoint_dir
         self.output_dir = output_dir
         self.force_restart = force_restart
+        self.throttle_delay = throttle_delay
 
         # Default to half of available cores (more conservative, prevents overheating)
         if max_workers is None:
@@ -570,7 +578,8 @@ class ParallelResearchValidationRunner:
                     checkpoint_prefix=self.checkpoint_prefix,
                     csv_path=str(self.csv_path),
                     progress_queue=progress_queue,
-                    worker_id=worker_id
+                    worker_id=worker_id,
+                    throttle_delay=self.throttle_delay
                 )
                 futures[future] = algo_key
 
@@ -871,6 +880,8 @@ def main():
                        help='Ignore existing checkpoints')
     parser.add_argument('--max-workers', type=int, default=None,
                        help='Maximum parallel workers (default: half of CPU cores)')
+    parser.add_argument('--throttle-delay', type=float, default=0.0,
+                       help='Seconds to sleep after each exploitability check (thermal control, default: 0)')
 
     args = parser.parse_args()
 
@@ -879,7 +890,10 @@ def main():
 
     print(f"\nCPU cores available: {os.cpu_count()}")
     print(f"Max workers: {default_workers} (default: half of cores)")
-    print(f"Process priority: Lowered (nice +10)\n")
+    print(f"Process priority: Lowered (nice +10)")
+    if args.throttle_delay > 0:
+        print(f"Thermal throttling: {args.throttle_delay}s sleep after each check (reduces heat)")
+    print()
 
     try:
         runner = ParallelResearchValidationRunner(
@@ -891,7 +905,8 @@ def main():
             checkpoint_prefix=args.checkpoint_prefix,
             output_dir=args.output_dir,
             force_restart=args.force_restart,
-            max_workers=args.max_workers
+            max_workers=args.max_workers,
+            throttle_delay=args.throttle_delay
         )
         runner.run()
     except KeyboardInterrupt:

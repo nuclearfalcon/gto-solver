@@ -10,6 +10,7 @@ The parallel implementation runs 5 different DCFR algorithm configurations simul
 
 ✅ **~5x faster** - Parallel execution on multi-core systems
 ✅ **CPU limiting** - Configurable limit (default 80%) via `--cpu-limit` flag
+✅ **Thermal throttling** - Optional cooldown delays via `--throttle-delay` for temperature control
 ✅ **Smart cleanup** - Recursive process tree termination on Ctrl+C
 ✅ **Memory safe** - Independent worker processes with file locking
 ✅ **Checkpoint support** - Resume interrupted runs
@@ -129,8 +130,67 @@ python compare_dcfr_research_3p_parallel.py [OPTIONS]
 | `--output-dir` | `results` | Directory for CSV results |
 | `--force-restart` | False | Ignore existing checkpoints and restart from scratch |
 | `--max-workers` | Half of CPU cores | Maximum parallel workers (capped at 6 for this script) |
+| `--throttle-delay` | 0.0 | Seconds to sleep after each exploitability check (thermal control) |
 
 ## Advanced Usage
+
+### Thermal Throttling (NEW!)
+
+If your CPU is still hitting max temperature even with `cpulimit`, you can add **throttle delays** to insert cooling periods during computation:
+
+```bash
+# Add 1-second cooldown after each exploitability check
+python compare_dcfr_research_3p_parallel.py \
+    --iterations 100000 \
+    --check-interval 10000 \
+    --throttle-delay 1.0
+
+# More aggressive: 3-second cooldown (cooler CPU, slower runtime)
+python compare_dcfr_research_3p_parallel.py \
+    --iterations 100000 \
+    --check-interval 10000 \
+    --throttle-delay 3.0
+
+# Combine with cpulimit and reduced workers for maximum cooling
+bash run_with_cpulimit.sh -c 60 compare_dcfr_research_3p_parallel.py \
+    --iterations 100000 \
+    --check-interval 10000 \
+    --max-workers 3 \
+    --throttle-delay 2.0
+```
+
+**How it works:**
+- After each exploitability check (every `--check-interval` iterations), workers sleep for the specified duration
+- This gives the CPU periodic rest periods to cool down
+- **Trade-off:** Increases total runtime proportionally to throttle delay
+- **Example:** With `--check-interval 10000` and `--throttle-delay 2.0`, workers sleep for 2 seconds every 10,000 iterations
+
+**When to use:**
+- ✅ Laptops with limited cooling
+- ✅ CPUs hitting thermal throttling despite `cpulimit`
+- ✅ Long runs where sustained heat is a concern
+- ✅ Background training while using system for other tasks
+
+**Recommended values:**
+- **Light throttling**: `--throttle-delay 0.5` (minimal impact, ~5-10% slower)
+- **Moderate throttling**: `--throttle-delay 1.0` to `2.0` (noticeable cooling, 10-20% slower)
+- **Heavy throttling**: `--throttle-delay 3.0` to `5.0` (significant cooling, 20-40% slower)
+
+**Combined thermal control strategy:**
+```bash
+# Three-layer thermal protection (recommended for laptops):
+bash run_with_cpulimit.sh --cpu-limit 70 compare_dcfr_research_3p_parallel.py \
+    --iterations 1000000 \
+    --check-interval 50000 \
+    --checkpoint-interval 100000 \
+    --max-workers 3 \
+    --throttle-delay 1.5
+```
+
+This combines:
+1. **cpulimit** at 70% (hard CPU cap)
+2. **max-workers 3** (reduce concurrent work)
+3. **throttle-delay 1.5s** (periodic cooldown breaks)
 
 ### Checkpointing for Long Runs
 
@@ -385,19 +445,34 @@ For 3-player Kuhn poker, memory usage is minimal (~100MB total).
 
 ### System Freezing / Overheating
 
-**Use CPU limiting:**
+**Option 1: Use CPU limiting (recommended first step):**
 ```bash
 bash run_with_cpulimit.sh compare_dcfr_research_3p_parallel.py --iterations 100000
 ```
 
-**Or reduce CPU limit using the flag:**
+**Option 2: Reduce CPU limit:**
 ```bash
 bash run_with_cpulimit.sh --cpu-limit 50 compare_dcfr_research_3p_parallel.py --iterations 100000
 ```
 
-**Or reduce workers:**
+**Option 3: Add thermal throttling (NEW - most effective for sustained heat):**
+```bash
+python compare_dcfr_research_3p_parallel.py \
+    --iterations 100000 \
+    --throttle-delay 1.5
+```
+
+**Option 4: Reduce workers:**
 ```bash
 python compare_dcfr_research_3p_parallel.py --iterations 100000 --max-workers 4
+```
+
+**Option 5: Combine all strategies (maximum cooling):**
+```bash
+bash run_with_cpulimit.sh --cpu-limit 60 compare_dcfr_research_3p_parallel.py \
+    --iterations 100000 \
+    --max-workers 3 \
+    --throttle-delay 2.0
 ```
 
 ### Lingering Processes After Ctrl+C
@@ -487,8 +562,27 @@ bash run_with_cpulimit.sh -c 50 compare_dcfr_research_3p_parallel.py \
     --iterations 1000000 \
     --check-interval 50000 \
     --checkpoint-interval 100000 \
-    --max-workers 4
+    --max-workers 4 \
+    --throttle-delay 1.0
 ```
+
+### Maximum Thermal Control (for overheating systems)
+
+```bash
+source ~/open_spiel/venv/bin/activate
+bash run_with_cpulimit.sh --cpu-limit 60 compare_dcfr_research_3p_parallel.py \
+    --iterations 1000000 \
+    --check-interval 50000 \
+    --checkpoint-interval 100000 \
+    --max-workers 3 \
+    --throttle-delay 2.0
+```
+
+This combines all thermal control strategies:
+- CPU limit at 60%
+- Only 3 workers
+- 2-second cooldown after each check
+- Slowest but coolest option
 
 ### Long Run with Custom Settings
 

@@ -72,8 +72,8 @@ class LinearExternalSamplingSolver(mccfr.MCCFRSolverBase):
         self.alpha = alpha
         self.beta = beta
 
-        # Iteration counter (starts at 1 for proper weighting)
-        self._iteration = 1
+        # Iteration counter (starts at 0, incremented before use, matching OpenSpiel)
+        self._iteration = 0
 
         assert game.get_type().dynamics == pyspiel.GameType.Dynamics.SEQUENTIAL, (
             "LCFR-ES requires sequential games. If you're trying to run it " +
@@ -85,24 +85,26 @@ class LinearExternalSamplingSolver(mccfr.MCCFRSolverBase):
         Performs one iteration of LCFR-ES.
 
         An iteration consists of:
-        1. One regret update episode for each player (external sampling)
-        2. One weighted average policy update pass (linear weighting)
+        1. INCREMENT iteration counter (CRITICAL: must be first, matching OpenSpiel)
+        2. One regret update episode for each player (external sampling)
+        3. Apply regret discounting (using current iteration)
+        4. One weighted average policy update pass (using current iteration weight)
         """
+        # INCREMENT FIRST (critical for correct discount factors and weights)
+        self._iteration += 1
+
         # Update regrets for each player (external sampling)
         for player in range(self._num_players):
             self._update_regrets(self._game.new_initial_state(), player)
 
-        # Update average policy with iteration weighting
-        reach_probs = np.ones(self._num_players, dtype=np.float64)
-        weight = self._iteration ** self.gamma
-        self._weighted_update_average(self._game.new_initial_state(), reach_probs, weight)
-
-        # Apply regret discounting if configured
+        # Apply regret discounting AFTER regret updates (using current iteration)
         if self.alpha is not None or self.beta is not None:
             self._discount_regrets()
 
-        # Increment iteration
-        self._iteration += 1
+        # Update average policy with current iteration weighting
+        reach_probs = np.ones(self._num_players, dtype=np.float64)
+        weight = self._iteration ** self.gamma
+        self._weighted_update_average(self._game.new_initial_state(), reach_probs, weight)
 
     def _weighted_update_average(self, state, reach_probs, weight):
         """
@@ -161,6 +163,9 @@ class LinearExternalSamplingSolver(mccfr.MCCFRSolverBase):
         - Positive regrets: multiply by t^alpha / (t^alpha + 1)
         - Negative regrets: multiply by t^beta / (t^beta + 1)
 
+        CRITICAL FIX: When beta=0, research intends "no discounting" (1.0),
+        NOT the formula result t^0/(t^0+1)=0.5 which causes "regret amnesia".
+
         This gradually reduces the influence of early regrets.
         """
         if self.alpha is None and self.beta is None:
@@ -168,15 +173,25 @@ class LinearExternalSamplingSolver(mccfr.MCCFRSolverBase):
 
         t = self._iteration
 
-        # Calculate discount factors
-        if self.alpha is not None:
+        # Calculate positive regret discount factor
+        if self.alpha is not None and self.alpha > 0:
             pos_discount = (t ** self.alpha) / ((t ** self.alpha) + 1)
+        elif self.alpha is not None and self.alpha == 0:
+            # alpha=0: explicit constant discount of 0.5 (exponential moving average)
+            pos_discount = 0.5
         else:
+            # alpha=None: no discounting
             pos_discount = 1.0
 
-        if self.beta is not None:
+        # Calculate negative regret discount factor
+        # CRITICAL FIX: beta=0 means "no discount" (1.0), NOT formula with t^0
+        if self.beta is not None and self.beta > 0:
             neg_discount = (t ** self.beta) / ((t ** self.beta) + 1)
+        elif self.beta is not None and self.beta == 0:
+            # beta=0: NO DISCOUNTING (1.0), fixes "regret amnesia" bug
+            neg_discount = 1.0
         else:
+            # beta=None: no discounting
             neg_discount = 1.0
 
         # Apply discounting to all regrets

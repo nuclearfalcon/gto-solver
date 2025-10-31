@@ -180,8 +180,8 @@ class LinearExternalSamplingSolver(mccfr.MCCFRSolverBase):
             neg_discount = 1.0
 
         # Apply discounting to all regrets
-        for info_state_key in self._info_state_nodes:
-            regret = self._info_state_nodes[info_state_key][mccfr.REGRET_INDEX]
+        for info_state_key in self._infostates:
+            regret = self._infostates[info_state_key][mccfr.REGRET_INDEX]
             for action_idx in range(len(regret)):
                 if regret[action_idx] > 0:
                     regret[action_idx] *= pos_discount

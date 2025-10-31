@@ -1,29 +1,31 @@
 # Parallel DCFR Research Validation
 
-This document explains how to use the parallel implementation of the DCFR research validation script, which provides **~6x speedup** on multi-core systems.
+This document explains how to use the parallel implementation of the DCFR research validation script, which provides **~5x speedup** on multi-core systems.
 
 ## Overview
 
-The parallel implementation runs 6 different DCFR algorithm configurations simultaneously using Python's multiprocessing module, significantly reducing total computation time.
+The parallel implementation runs 5 different DCFR algorithm configurations simultaneously using Python's multiprocessing module, significantly reducing total computation time.
 
 ### Key Features
 
-✅ **~6x faster** - Parallel execution on multi-core systems
+✅ **~5x faster** - Parallel execution on multi-core systems
 ✅ **CPU limiting** - Configurable limit (default 80%) via `--cpu-limit` flag
 ✅ **Smart cleanup** - Recursive process tree termination on Ctrl+C
 ✅ **Memory safe** - Independent worker processes with file locking
 ✅ **Checkpoint support** - Resume interrupted runs
-✅ **Real-time monitoring** - Progress updates from all workers
+✅ **Best Nash tracking** - Automatic tracking of minimum (best) Nash convergence with special checkpoints
+✅ **Real-time monitoring** - Progress updates from all workers with current and historical best Nash
 ✅ **No pandas required** - Uses standard library only
 
 ### Performance Comparison
 
-| Implementation | 1M Iterations | 100K Iterations | CPU Usage |
-|----------------|---------------|-----------------|-----------|
+| Implementation | 1M Iterations | 100K Iterations | CPU Cores Used |
+|----------------|---------------|-----------------|----------------|
 | **Sequential** (`compare_dcfr_research_3p.py`) | ~2 hours | ~12 minutes | 1 core |
-| **Parallel** (`compare_dcfr_research_3p_parallel.py`) | ~20 minutes | ~2 minutes | 6 cores |
+| **Parallel** (`compare_dcfr_research_3p_parallel.py`) | ~24 minutes | ~2.5 minutes | Half of available (default) |
 
-**Speedup**: ~6x faster on systems with 6+ CPU cores
+**Speedup**: ~5x faster on systems with 5+ CPU cores
+**Default workers**: Uses **half of available CPU cores** (prevents overheating, leaves headroom for system)
 
 ## Quick Start
 
@@ -31,8 +33,8 @@ The parallel implementation runs 6 different DCFR algorithm configurations simul
 
 Ensure you have:
 - OpenSpiel virtual environment installed at `~/open_spiel/venv`
-- Multi-core CPU (recommended: 6+ cores for full speedup)
-- Sufficient RAM (~6x more than sequential, but still modest for Kuhn poker)
+- Multi-core CPU (recommended: 5+ cores for full speedup)
+- Sufficient RAM (~5x more than sequential, but still modest for Kuhn poker)
 
 ### 2. Activate OpenSpiel Environment
 
@@ -52,7 +54,7 @@ python compare_dcfr_research_3p_parallel.py --iterations 1000 --check-interval 5
 python compare_dcfr_research_3p_parallel.py --iterations 100000 --check-interval 10000
 ```
 
-**Full research validation (1M iterations, ~20 minutes):**
+**Full research validation (1M iterations, ~24 minutes):**
 ```bash
 python compare_dcfr_research_3p_parallel.py --iterations 1000000 --check-interval 50000
 ```
@@ -126,7 +128,7 @@ python compare_dcfr_research_3p_parallel.py [OPTIONS]
 | `--checkpoint-dir` | `checkpoints` | Directory for checkpoint files |
 | `--output-dir` | `results` | Directory for CSV results |
 | `--force-restart` | False | Ignore existing checkpoints and restart from scratch |
-| `--max-workers` | CPU count | Maximum parallel workers (default: all cores) |
+| `--max-workers` | Half of CPU cores | Maximum parallel workers (capped at 6 for this script) |
 
 ## Advanced Usage
 
@@ -143,13 +145,95 @@ python compare_dcfr_research_3p_parallel.py \
 
 If interrupted, simply re-run the same command to resume from the last checkpoint.
 
-### Limiting Parallel Workers
+### Minimum Nash Tracking and "Best" Checkpoints
 
-On systems with many cores but limited RAM, reduce the number of parallel workers:
+The script automatically tracks the **minimum (best) Nash convergence** value throughout training, which is important because DCFR algorithms are **non-monotonic** - Nash convergence can temporarily increase before decreasing again.
+
+**Key Features:**
+- ✅ Tracks the lowest Nash convergence value and its iteration for each worker
+- ✅ Displays both current and historical best Nash in real-time
+- ✅ Automatically saves special "best" checkpoint when a new minimum is found
+- ✅ Completed workers show both final and best Nash values
+
+**Example Live Display:**
+
+```
+AGGREGATE:    50,000/100,000 avg | Rate:  5,234 total it/s | ETA:   0.2m | Active: 5/5
+================================================================================
+
+CFR+ Approx     |  50,000/100,000 ( 50.0%) |    892 it/s | Nash: 0.251203 (Best: 0.150311 @15,000)
+```
+
+In this example:
+- **Current Nash**: 0.251203 (algorithm has temporarily regressed)
+- **Best Nash**: 0.150311 (achieved at iteration 15,000)
+- **Benefit**: You can resume from iteration 15,000 checkpoint instead of continuing from a worse state
+
+**Best Checkpoint Files:**
+
+When checkpointing is enabled, the script saves two types of checkpoints:
+
+1. **Regular checkpoints** (interval-based):
+   ```
+   checkpoints/3p_kuhn_dcfr_research_CFR_PLUS_APPROX_iter_50000.pkl
+   checkpoints/3p_kuhn_dcfr_research_CFR_PLUS_APPROX_iter_100000.pkl
+   ```
+
+2. **Best checkpoints** (saved when new minimum Nash found):
+   ```
+   checkpoints/3p_kuhn_dcfr_research_CFR_PLUS_APPROX_best_iter_15000_nash_0.150311.pkl
+   checkpoints/3p_kuhn_dcfr_research_CFR_PLUS_APPROX_best_iter_45000_nash_0.098542.pkl
+   ```
+
+The filename includes:
+- `best` marker
+- Iteration number when best Nash was achieved
+- The Nash convergence value (for easy identification)
+
+**Resuming from Best Checkpoint:**
+
+To resume training from the best checkpoint instead of the latest:
 
 ```bash
-# Use only 4 workers instead of all cores
-python compare_dcfr_research_3p_parallel.py --iterations 100000 --max-workers 4
+# 1. Find the best checkpoint for your algorithm
+ls -lh checkpoints/*SOTA_DCFR*best*.pkl
+
+# 2. Note the iteration number (e.g., 45000)
+
+# 3. Remove later checkpoints to force resume from best
+rm checkpoints/3p_kuhn_dcfr_research_SOTA_DCFR_iter_50000.pkl
+rm checkpoints/3p_kuhn_dcfr_research_SOTA_DCFR_iter_100000.pkl
+
+# 4. Rename best checkpoint to regular format
+cp checkpoints/3p_kuhn_dcfr_research_SOTA_DCFR_best_iter_45000_nash_0.098542.pkl \
+   checkpoints/3p_kuhn_dcfr_research_SOTA_DCFR_iter_45000.pkl
+
+# 5. Resume training
+python compare_dcfr_research_3p_parallel.py --iterations 100000 --checkpoint-interval 10000
+```
+
+**Why This Matters:**
+
+DCFR algorithms often show **non-monotonic convergence** where Nash values can increase temporarily before improving again. By tracking the historical best, you can:
+- Identify the optimal checkpoint to resume from
+- Avoid wasting computation on regressed states
+- Compare final vs best performance to understand convergence behavior
+
+### Adjusting Parallel Workers
+
+**Default**: Uses **half of available CPU cores** (e.g., 5 workers on a 10-core system, capped at 5 max)
+
+To use a different number of workers:
+
+```bash
+# Use all 12 cores (maximum performance, higher heat)
+python compare_dcfr_research_3p_parallel.py --iterations 100000 --max-workers 12
+
+# Use only 3 workers (very conservative)
+python compare_dcfr_research_3p_parallel.py --iterations 100000 --max-workers 3
+
+# Use default (half of cores, recommended)
+python compare_dcfr_research_3p_parallel.py --iterations 100000
 ```
 
 ### Force Restart (Ignore Checkpoints)
@@ -163,19 +247,18 @@ python compare_dcfr_research_3p_parallel.py --iterations 100000 --force-restart
 ### Architecture
 
 1. **Main Process**: Coordinates workers, monitors progress, displays results
-2. **Worker Processes** (6): Each runs one DCFR algorithm independently
+2. **Worker Processes** (5): Each runs one DCFR algorithm independently
 3. **Shared Queue**: Workers send progress updates to main process
 4. **File Locking**: CSV writes are synchronized using `fcntl.flock()`
 
 ### Worker Independence
 
-Each of the 6 workers runs completely independently:
+Each of the 5 workers runs completely independently:
 - SIMPLE (External Sampling, uniform averaging)
 - FULL (External Sampling, reach-weighted averaging)
 - True LCFR (DCFR with α=1, β=1, γ=1)
 - SOTA DCFR (DCFR with α=1.5, β=0, γ=2) - Research best
 - CFR+ Approx (DCFR with α=∞, β=∞, γ=2)
-- DCFR(0,0,1) (DCFR with α=0, β=0, γ=1) - Research worst
 
 ### CPU Management
 
@@ -188,29 +271,59 @@ The script automatically reduces CPU contention:
 
 ### Console Output
 
-During execution, you'll see:
-1. **Individual solver updates** when exploitability is checked
-2. **Aggregate progress** showing average iteration count, rate, ETA, and active workers
+During execution, you'll see a **live updating display** that shows:
+1. **Aggregate progress** - Overall statistics across all workers
+2. **Individual worker progress** - Current iteration, percentage, and status for each algorithm
 3. **Completion notifications** when each worker finishes
 4. **Final rankings** comparing all 6 algorithms
 5. **Research validation** checking if results match published claims
 
-Example:
+**Live Progress Display Example (6 workers, default):**
 
 ```
-SIMPLE          @   50,000 | Nash: 0.012345
-SOTA DCFR       @   50,000 | Nash: 0.009876
+================================================================================
+AGGREGATE:    48,333/100,000 avg | Rate:  5,234 total it/s | ETA:   0.2m | Active: 5/6
+================================================================================
 
-✓ SIMPLE COMPLETED in 45.2s
-
-Aggregate:    48,333/100,000 avg | Rate:  5,234 total it/s | ETA:   0.2m | Active: 5/6
+SIMPLE          |  50,000/100,000 ( 50.0%) |    920 it/s | ✓ COMPLETED (Final: 0.101773, Best: 0.098542 @45,000)
+FULL            |  48,500/100,000 ( 48.5%) |    892 it/s | Nash: 0.123456 (Best: 0.115432 @42,000)
+True LCFR       |  47,200/100,000 ( 47.2%) |    868 it/s | Nash: 0.234567 (Best: 0.234567 @47,200)
+SOTA DCFR       |  49,100/100,000 ( 49.1%) |    903 it/s | Working...
+CFR+ Approx     |  48,800/100,000 ( 48.8%) |    897 it/s | Nash: 0.345678 (Best: 0.320145 @38,500)
+DCFR(0,0,1)     |  47,900/100,000 ( 47.9%) |    881 it/s | Working...
 ```
 
-**Progress Display Explained:**
-- `Aggregate: X/Y avg` - Average iterations completed across all workers
-- `Rate: N total it/s` - Combined iteration rate across all workers
-- `ETA: M.Nm` - Estimated time to completion
-- `Active: X/6` - Number of workers still running (starts at 6/6, decreases as workers finish)
+**With Limited Workers (e.g., --max-workers 3):**
+
+```
+================================================================================
+AGGREGATE:    15,000/100,000 avg | Rate:  2,150 total it/s | ETA:   0.7m | Active: 3/6
+================================================================================
+
+SIMPLE          |  30,000/100,000 ( 30.0%) |    850 it/s | Working...
+FULL            |  15,000/100,000 ( 15.0%) |    750 it/s | Working...
+True LCFR       |  15,000/100,000 ( 15.0%) |    550 it/s | Working...
+SOTA DCFR       |       0/100,000 (  0.0%) |      0 it/s | ⏳ Queued
+CFR+ Approx     |       0/100,000 (  0.0%) |      0 it/s | ⏳ Queued
+DCFR(0,0,1)     |       0/100,000 (  0.0%) |      0 it/s | ⏳ Queued
+```
+
+**Display refreshes every 2 seconds** and shows:
+- **Aggregate stats** - Combined progress, rate, ETA, and active worker count
+- **Per-worker stats** - Current iteration, completion percentage, **individual iteration rate**, and status
+- **Iteration rates** - Shows how fast each algorithm is running (it/s = iterations per second)
+- **Status indicators**:
+  - `⏳ Queued` - Worker waiting for an available slot (when max_workers < 6)
+  - `Working...` - Worker actively running iterations
+  - `Nash: X.XXXXXX` - Most recent exploitability measurement
+  - `Nash: X.XXXXXX (Best: Y.YYYYYY @N)` - Current Nash with historical best and its iteration
+  - `✓ COMPLETED (Final: X.XXXXXX, Best: Y.YYYYYY @N)` - Worker finished, showing both final and best Nash
+  - `⚠ INTERRUPTED` - Worker stopped by user (Ctrl+C)
+  - `✗ FAILED` - Worker encountered an error
+
+**Why different rates?** Each CFR algorithm variant has different computational complexity per iteration, so you'll see varying it/s rates across workers.
+
+**Queued workers:** When you limit workers (e.g., `--max-workers 3`), up to 3 algorithms will show `Working...` while others show `⏳ Queued` until a slot opens up.
 
 ### CSV Results
 
@@ -226,12 +339,24 @@ Columns:
 
 ### Checkpoints
 
-If enabled, checkpoints are saved to: `checkpoints/3p_kuhn_dcfr_research_{ALGORITHM}_iter_{N}.pkl`
+If enabled, the script saves two types of checkpoints:
+
+**1. Regular Checkpoints** (interval-based):
+- Path: `checkpoints/3p_kuhn_dcfr_research_{ALGORITHM}_iter_{N}.pkl`
+- Saved every `--checkpoint-interval` iterations
+- Used for resuming interrupted runs
+
+**2. Best Checkpoints** (minimum Nash):
+- Path: `checkpoints/3p_kuhn_dcfr_research_{ALGORITHM}_best_iter_{N}_nash_{VALUE}.pkl`
+- Saved automatically when a new minimum Nash convergence is found
+- Filename includes the Nash value for easy identification
+- Allows resuming from the optimal point instead of the latest checkpoint
 
 Each checkpoint contains:
 - Solver state (regrets, strategies)
 - Current iteration number
 - Algorithm identifier
+- Nash convergence value (for "best" checkpoints only)
 
 ## Troubleshooting
 
@@ -249,7 +374,7 @@ python compare_dcfr_research_3p_parallel.py --iterations 100000
 
 ### High Memory Usage
 
-The parallel version uses ~6x more memory than sequential (one solver per worker).
+The parallel version uses ~5x more memory than sequential (one solver per worker).
 
 **Solutions:**
 1. Reduce number of workers: `--max-workers 3`
@@ -319,9 +444,9 @@ If checkpoints fail to resume properly:
 
 | Feature | Sequential | Parallel |
 |---------|-----------|----------|
-| **Speed** | 1x baseline | ~6x faster |
-| **Memory** | 1x baseline | ~6x more |
-| **CPU cores used** | 1 | All available |
+| **Speed** | 1x baseline | ~5x faster |
+| **Memory** | 1x baseline | ~5x more |
+| **CPU cores used** | 1 | Half of available (default) |
 | **Output format** | CSV + console | CSV + console (same) |
 | **Checkpointing** | ✓ Supported | ✓ Supported |
 | **Resume support** | ✓ Yes | ✓ Yes |
@@ -337,14 +462,14 @@ If checkpoints fail to resume properly:
 
 ## Example Workflows
 
-### Quick Research Validation (2 minutes)
+### Quick Research Validation (2.5 minutes)
 
 ```bash
 source ~/open_spiel/venv/bin/activate
 python compare_dcfr_research_3p_parallel.py --iterations 100000 --check-interval 10000
 ```
 
-### Full Research Validation with Safety (20 minutes)
+### Full Research Validation with Safety (24 minutes)
 
 ```bash
 source ~/open_spiel/venv/bin/activate

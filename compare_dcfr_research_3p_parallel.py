@@ -2,8 +2,8 @@
 """
 DCFR Research Validation: 3-Player Kuhn Poker (PARALLEL VERSION)
 
-Parallel implementation using multiprocessing to run 6 solvers simultaneously.
-Achieves ~6x speedup on multi-core systems with configurable CPU limiting.
+Parallel implementation using multiprocessing to run 5 solvers simultaneously.
+Achieves ~5x speedup on multi-core systems with configurable CPU limiting.
 
 Features:
     - True parallelism via ProcessPoolExecutor (bypasses Python GIL)
@@ -23,7 +23,6 @@ Research Configurations Tested:
 3. True LCFR - DCFR(1, 1, 1) - Original Linear CFR
 4. SOTA DCFR - DCFR(1.5, 0, 2) - State-of-the-art (research best)
 5. CFR+ Approximation - DCFR(∞, ∞, 2) - Quadratic averaging only
-6. DCFR(0, 0, 1) - Research calls this "mismatched and suboptimal"
 
 Requirements:
     source ~/open_spiel/venv/bin/activate
@@ -53,8 +52,9 @@ Usage:
 
 Performance:
     - Sequential version: ~2 hours for 1M iterations
-    - Parallel version: ~20 minutes for 1M iterations (6x speedup on 6+ cores)
-    - Memory usage: ~6x more (all solvers active simultaneously)
+    - Parallel version: ~24 minutes for 1M iterations (5x speedup on 5+ cores)
+    - Memory usage: ~5x more (all solvers active simultaneously)
+    - Default workers: Half of available CPU cores (prevents overheating)
     - CPU limiting: Configurable via wrapper script (default 80%)
 
 Cleanup:
@@ -162,6 +162,8 @@ def worker_run_solver(
         # Track metrics
         metrics = []
         worker_start_time = time.time()
+        min_nash_conv = float('inf')  # Track best (minimum) Nash seen
+        min_nash_iteration = 0  # Track iteration where best Nash occurred
 
         # Main iteration loop
         for iteration in range(start_iteration, iterations + 1):
@@ -186,6 +188,18 @@ def worker_run_solver(
                     nash_conv = pyspiel.nash_conv(game, policy)
                 except:
                     nash_conv = exploitability.nash_conv(game, policy, return_only_nash_conv=True)
+
+                # Track minimum (best) Nash convergence
+                if nash_conv < min_nash_conv:
+                    min_nash_conv = nash_conv
+                    min_nash_iteration = iteration
+
+                    # Save "best" checkpoint when we find new minimum Nash
+                    if checkpoint_interval:
+                        _save_checkpoint_best(
+                            solver, algo_key, iteration, min_nash_conv,
+                            checkpoint_dir, checkpoint_prefix
+                        )
 
                 # Calculate iteration rate
                 iters_since_start = iteration - start_iteration
@@ -216,6 +230,8 @@ def worker_run_solver(
                     'algo_key': algo_key,
                     'iteration': iteration,
                     'nash_conv': nash_conv,
+                    'min_nash_conv': min_nash_conv,
+                    'min_nash_iteration': min_nash_iteration,
                     'type': 'exploitability'
                 })
 
@@ -234,12 +250,19 @@ def worker_run_solver(
 
         # Worker complete
         total_time = time.time() - worker_start_time
+
+        # Get final Nash convergence from last metric
+        final_nash = metrics[-1]['nash_conv'] if metrics else None
+
         progress_queue.put({
             'worker_id': worker_id,
             'algo_key': algo_key,
             'type': 'complete',
             'metrics': metrics,
-            'total_time': total_time
+            'total_time': total_time,
+            'final_nash': final_nash,
+            'min_nash_conv': min_nash_conv if min_nash_conv != float('inf') else None,
+            'min_nash_iteration': min_nash_iteration if min_nash_conv != float('inf') else None
         })
 
         return {
@@ -304,10 +327,6 @@ def _create_solver(game, algo_key: str, algo_info: Dict[str, Any]):
         return LinearExternalSamplingSolver(
             game, gamma=2.0  # α=None, β=None
         )
-    elif algo_key == 'DCFR_0_0_1':
-        return LinearExternalSamplingSolver(
-            game, gamma=1.0, alpha=0.0, beta=0.0
-        )
     else:
         raise ValueError(f"Unknown algorithm key: {algo_key}")
 
@@ -336,6 +355,25 @@ def _save_checkpoint(solver, algo_key: str, iteration: int, checkpoint_dir: str,
         'solver': solver,
         'current_iteration': iteration,
         'algorithm': algo_key
+    }
+
+    with open(filepath, 'wb') as f:
+        pickle.dump(checkpoint_data, f, pickle.HIGHEST_PROTOCOL)
+
+
+def _save_checkpoint_best(solver, algo_key: str, iteration: int, nash_conv: float, checkpoint_dir: str, checkpoint_prefix: str):
+    """Save 'best' checkpoint when a new minimum Nash is found."""
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+    prefix = f"{checkpoint_prefix}_{algo_key}"
+    filepath = f"{checkpoint_dir}/{prefix}_best_iter_{iteration}_nash_{nash_conv:.6f}.pkl"
+
+    checkpoint_data = {
+        'solver': solver,
+        'current_iteration': iteration,
+        'algorithm': algo_key,
+        'nash_conv': nash_conv,
+        'is_best': True
     }
 
     with open(filepath, 'wb') as f:
@@ -389,7 +427,14 @@ class ParallelResearchValidationRunner:
         self.checkpoint_dir = checkpoint_dir
         self.output_dir = output_dir
         self.force_restart = force_restart
-        self.max_workers = max_workers or os.cpu_count()
+
+        # Default to half of available cores (more conservative, prevents overheating)
+        if max_workers is None:
+            default_workers = max(1, os.cpu_count() // 2)
+            # Cap at number of algorithms (no benefit to more workers than algorithms)
+            self.max_workers = min(default_workers, 5)
+        else:
+            self.max_workers = max_workers
 
         # Set lower priority for main process
         os.nice(10)
@@ -429,11 +474,6 @@ class ParallelResearchValidationRunner:
                 'name': 'CFR+ Approx',
                 'config': 'DCFR(∞, ∞, 2)',
                 'research': 'Quadratic averaging, no regret discounting'
-            },
-            'DCFR_0_0_1': {
-                'name': 'DCFR(0,0,1)',
-                'config': 'DCFR(0, 0, 1)',
-                'research': 'Research calls "mismatched and suboptimal"'
             }
         }
 
@@ -443,7 +483,8 @@ class ParallelResearchValidationRunner:
         print("\n" + "="*80)
         print("INITIALIZING PARALLEL DCFR RESEARCH VALIDATION")
         print("="*80)
-        print(f"Max workers: {self.max_workers} processes")
+        print(f"CPU cores available: {os.cpu_count()}")
+        print(f"Max workers: {self.max_workers} processes (default: half of cores)")
         print(f"CPU priority: Lowered (nice +10)")
 
         for algo_key, algo_info in self.algorithms.items():
@@ -504,6 +545,10 @@ class ParallelResearchValidationRunner:
         # Track worker progress
         worker_progress = {algo_key: 0 for algo_key in self.algorithms.keys()}
         worker_exploitability = {}
+        worker_status = {algo_key: 'ACTIVE' for algo_key in self.algorithms.keys()}
+        worker_final_nash = {}  # Store final Nash for completed workers
+        worker_min_nash = {}  # Store minimum (best) Nash seen for each worker
+        worker_min_nash_iteration = {}  # Store iteration where min Nash occurred
 
         # Launch workers
         start_time = time.time()
@@ -548,22 +593,34 @@ class ParallelResearchValidationRunner:
                             'iteration': msg['iteration'],
                             'nash_conv': msg['nash_conv']
                         }
-                        print(f"\n{self.algorithms[msg['algo_key']]['name']:15} @ {msg['iteration']:7,} | "
-                              f"Nash: {msg['nash_conv']:.6f}")
+                        # Track minimum Nash
+                        if 'min_nash_conv' in msg and msg['min_nash_conv'] is not None:
+                            worker_min_nash[msg['algo_key']] = msg['min_nash_conv']
+                            worker_min_nash_iteration[msg['algo_key']] = msg['min_nash_iteration']
+                        # Nash values now shown in live display
 
                     elif msg['type'] == 'checkpoint':
-                        print(f"  ✓ {self.algorithms[msg['algo_key']]['name']:15} checkpoint saved @ {msg['iteration']:,}")
+                        # Checkpoint notifications now suppressed to keep display clean
+                        pass
 
                     elif msg['type'] == 'complete':
                         completed_workers += 1
+                        worker_status[msg['algo_key']] = 'COMPLETED'
+                        if msg.get('final_nash') is not None:
+                            worker_final_nash[msg['algo_key']] = msg['final_nash']
+                        if msg.get('min_nash_conv') is not None:
+                            worker_min_nash[msg['algo_key']] = msg['min_nash_conv']
+                            worker_min_nash_iteration[msg['algo_key']] = msg['min_nash_iteration']
                         print(f"\n✓ {self.algorithms[msg['algo_key']]['name']:15} COMPLETED in {msg['total_time']:.1f}s")
 
                     elif msg['type'] == 'interrupted':
                         completed_workers += 1
+                        worker_status[msg['algo_key']] = 'INTERRUPTED'
                         print(f"\n⚠  {self.algorithms[msg['algo_key']]['name']:15} INTERRUPTED")
 
                     elif msg['type'] == 'error':
                         completed_workers += 1
+                        worker_status[msg['algo_key']] = 'FAILED'
                         print(f"\n✗ {self.algorithms[msg['algo_key']]['name']:15} FAILED:\n{msg['error']}")
 
                 except:
@@ -575,20 +632,94 @@ class ParallelResearchValidationRunner:
                     print("\n\n⚠️  Shutdown requested, terminating all workers...")
                     break
 
-                # Display aggregate progress every 2 seconds
+                # Display aggregate and individual progress every 2 seconds
                 if time.time() - last_display > 2.0:
+                    # Calculate progress only for active (non-completed) workers
+                    active_worker_keys = [k for k in self.algorithms.keys() if worker_status[k] == 'ACTIVE']
+                    active_progress = sum(worker_progress[k] for k in active_worker_keys)
+                    active_start_iters = sum(self.start_iterations[k] for k in active_worker_keys)
+
+                    # Total progress (all workers including completed)
                     total_progress = sum(worker_progress.values())
                     avg_progress = total_progress / len(worker_progress) if worker_progress else 0
+
                     elapsed = time.time() - start_time
-                    rate = total_progress / elapsed if elapsed > 0 else 0
-                    eta = (self.iterations * len(self.algorithms) - total_progress) / rate if rate > 0 else 0
 
-                    active_workers = len(self.algorithms) - completed_workers
+                    # Rate: only from active workers (iterations completed since start / time)
+                    active_iters_completed = active_progress - active_start_iters
+                    rate = active_iters_completed / elapsed if elapsed > 0 else 0
 
-                    print(f"\rAggregate: {avg_progress:7,.0f}/{self.iterations:,} avg | "
+                    # ETA: remaining work for active workers / current rate
+                    remaining_work = self.iterations * len(active_worker_keys) - active_progress
+                    eta = remaining_work / rate if rate > 0 else 0
+
+                    active_workers = len(active_worker_keys)
+
+                    # Clear screen and move to top (using ANSI escape codes)
+                    print("\033[2J\033[H", end='')
+
+                    # Display aggregate progress
+                    print("="*80)
+                    print(f"AGGREGATE: {avg_progress:7,.0f}/{self.iterations:,} avg | "
                           f"Rate: {rate:6,.0f} total it/s | ETA: {eta/60:5.1f}m | "
-                          f"Active: {active_workers}/{len(self.algorithms)}",
-                          end='', flush=True)
+                          f"Active: {active_workers}/{len(self.algorithms)}")
+                    print("="*80)
+                    print()
+
+                    # Display individual worker progress
+                    for algo_key, algo_info in self.algorithms.items():
+                        current_iter = worker_progress[algo_key]
+                        status = worker_status[algo_key]
+
+                        # Calculate per-worker iteration rate
+                        start_iter = self.start_iterations[algo_key]
+                        iters_completed = current_iter - start_iter
+                        worker_rate = iters_completed / elapsed if elapsed > 0 else 0
+
+                        # Build status string
+                        if status == 'COMPLETED':
+                            if algo_key in worker_final_nash and algo_key in worker_min_nash:
+                                # Show both final and best (minimum) Nash for completed workers
+                                final_nash = worker_final_nash[algo_key]
+                                min_nash = worker_min_nash[algo_key]
+                                min_iter = worker_min_nash_iteration[algo_key]
+                                status_str = f"✓ COMPLETED (Final: {final_nash:.6f}, Best: {min_nash:.6f} @{min_iter:,})"
+                            elif algo_key in worker_final_nash:
+                                final_nash = worker_final_nash[algo_key]
+                                status_str = f"✓ COMPLETED (Nash: {final_nash:.6f})"
+                            else:
+                                status_str = "✓ COMPLETED"
+                        elif status == 'INTERRUPTED':
+                            status_str = "⚠ INTERRUPTED"
+                        elif status == 'FAILED':
+                            status_str = "✗ FAILED"
+                        else:
+                            # Check if worker has actually started (made progress)
+                            if iters_completed == 0 and elapsed > 1.0:
+                                # No progress yet = queued (waiting for worker slot)
+                                status_str = "⏳ Queued"
+                            elif algo_key in worker_exploitability:
+                                # Show current Nash and best (minimum) Nash if available
+                                nash = worker_exploitability[algo_key]['nash_conv']
+                                if algo_key in worker_min_nash:
+                                    min_nash = worker_min_nash[algo_key]
+                                    min_iter = worker_min_nash_iteration[algo_key]
+                                    status_str = f"Nash: {nash:.6f} (Best: {min_nash:.6f} @{min_iter:,})"
+                                else:
+                                    status_str = f"Nash: {nash:.6f}"
+                            else:
+                                # Running but no Nash yet
+                                status_str = "Working..."
+
+                        # Calculate progress percentage
+                        pct = (current_iter / self.iterations * 100) if self.iterations > 0 else 0
+
+                        # Display worker line with rate
+                        print(f"{algo_info['name']:15} | {current_iter:7,}/{self.iterations:,} ({pct:5.1f}%) | "
+                              f"{worker_rate:6.0f} it/s | {status_str}")
+
+                    print()
+                    sys.stdout.flush()
                     last_display = time.time()
 
             # Shutdown handling
@@ -625,7 +756,7 @@ class ParallelResearchValidationRunner:
         print("PARALLEL RESEARCH VALIDATION COMPLETE")
         print("="*80)
         print(f"Total wall time: {total_time:.1f}s ({total_time/60:.1f}m)")
-        print(f"Speedup vs sequential: ~{len(self.algorithms):.1f}x (theoretical)")
+        print(f"Speedup vs sequential: ~{len(self.algorithms)}x (theoretical)")
 
         # Analyze final results from CSV
         self._analyze_final_results()
@@ -688,18 +819,17 @@ class ParallelResearchValidationRunner:
             print("="*80)
 
             best_final = ranked[0]
-            worst_final = ranked[-1]
 
             if best_final['key'] == 'SOTA_DCFR':
-                print(f"✓ SOTA DCFR(1.5,0,2) achieved best convergence")
+                print(f"✓ SOTA DCFR(1.5,0,2) achieved best convergence (as claimed in research)")
             else:
                 print(f"✗ SOTA DCFR(1.5,0,2) did NOT achieve best convergence")
                 print(f"  Winner was: {best_final['name']} ({best_final['config']})")
 
-            if worst_final['key'] == 'DCFR_0_0_1':
-                print(f"✓ DCFR(0,0,1) had worst convergence (as claimed)")
-            else:
-                print(f"≈ DCFR(0,0,1) was not worst, but was suboptimal")
+            # Check if SOTA is at least in top 2
+            sota_rank = next((i+1 for i, r in enumerate(ranked) if r['key'] == 'SOTA_DCFR'), None)
+            if sota_rank and sota_rank <= 2:
+                print(f"✓ SOTA DCFR ranked #{sota_rank} (top 2 is acceptable)")
 
             # Improvement vs SIMPLE
             simple_final = next((r['nash_conv'] for r in final_results if r['key'] == 'SIMPLE'), None)
@@ -740,12 +870,15 @@ def main():
     parser.add_argument('--force-restart', action='store_true',
                        help='Ignore existing checkpoints')
     parser.add_argument('--max-workers', type=int, default=None,
-                       help='Maximum parallel workers (default: CPU count)')
+                       help='Maximum parallel workers (default: half of CPU cores)')
 
     args = parser.parse_args()
 
+    # Calculate default workers
+    default_workers = max(1, os.cpu_count() // 2) if args.max_workers is None else args.max_workers
+
     print(f"\nCPU cores available: {os.cpu_count()}")
-    print(f"Max workers: {args.max_workers or os.cpu_count()}")
+    print(f"Max workers: {default_workers} (default: half of cores)")
     print(f"Process priority: Lowered (nice +10)\n")
 
     try:

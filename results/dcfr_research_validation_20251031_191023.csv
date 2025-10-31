@@ -1,0 +1,2 @@
+iteration,algorithm,config,nash_conv,wall_time_sec,iterations_per_sec
+50000,SIMPLE,External Sampling,0.024942619577059122,56.750409841537476,881.0509058809188

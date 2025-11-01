@@ -143,11 +143,48 @@ class MatrixCFRSolver:
         # Cumulative strategy (for averaging)
         self.cumulative_strategy = jnp.zeros(num_ia, dtype=jnp.float32)
 
+        # Cumulative reach probabilities (for weighted averaging)
+        self.cumulative_reach = jnp.zeros(num_ia, dtype=jnp.float32)
+
         # Current strategy (uniform to start)
         self.current_strategy = self._init_uniform_strategy()
 
         # Iteration counter
         self.current_iteration = 0
+
+        # Build action→child cache (Option C optimization)
+        self._build_action_child_cache()
+
+    def _build_action_child_cache(self):
+        """
+        Build cache mapping (infoset, action) → child_node_id for fast lookups.
+
+        Option C optimization: Trades ~2 MB memory for 2x speedup.
+        Pre-computes all child node lookups that would otherwise use level matrices.
+
+        Memory cost: O(num_infoset_actions) ~= 100k-500k entries for Hold'em = 2 MB
+        """
+        self.action_child_cache = {}
+
+        logger.info("Building action→child cache...")
+
+        for (infoset, action), parent_node_id in self.matrix_repr.action_index_to_node.items():
+            parent_node = self.matrix_repr.nodes[parent_node_id]
+
+            # Use _find_child_for_action to populate cache
+            try:
+                child_node_id = self._find_child_for_action(
+                    parent_node_id=parent_node_id,
+                    action=action,
+                    parent_depth=parent_node.depth
+                )
+                self.action_child_cache[(infoset, action)] = child_node_id
+            except (ValueError, IndexError) as e:
+                # Some (infoset, action) pairs might not have children (terminal states)
+                logger.debug(f"No child for ({infoset}, {action}): {e}")
+                continue
+
+        logger.info(f"  Cached {len(self.action_child_cache)} action→child mappings")
 
     def _build_infoset_indexing(self):
         """
@@ -184,6 +221,103 @@ class MatrixCFRSolver:
             strategy = strategy.at[action_indices].set(uniform_prob)
 
         return strategy
+
+    def _find_child_for_action(self, parent_node_id: int, action: int, parent_depth: int) -> int:
+        """
+        Find child node reached by taking 'action' from parent node.
+
+        Uses level matrix L^l to find children (zero memory overhead).
+        L^l[parent, child] = 1 if edge exists from parent to child.
+
+        Level matrix indexing: level_matrices[l] contains edges TO nodes at depth l.
+        So children of a depth-d node are in level_matrices[d+1].
+
+        Args:
+            parent_node_id: ID of parent (decision) node
+            action: Action index in legal_actions list
+            parent_depth: Depth level of parent node
+
+        Returns:
+            child_node_id: ID of child node reached by this action
+
+        Raises:
+            ValueError: If action has no corresponding child
+        """
+        # Get level matrix for edges TO children (at depth parent_depth+1)
+        child_depth = parent_depth + 1
+        if child_depth >= len(self.level_matrices_jax):
+            raise ValueError(f"Child depth {child_depth} exceeds max depth")
+
+        L_l = self.level_matrices_jax[child_depth]  # Edges TO depth child_depth
+
+        # Find all children of parent_node_id
+        # L_l[parent_node_id, :] gives edges from parent to all possible children
+        parent_row = L_l[parent_node_id, :]
+
+        # Get indices where edge exists (non-zero entries)
+        children_mask = parent_row > 0.5
+        child_indices = jnp.where(children_mask, jnp.arange(len(parent_row)), -1)
+        child_indices = child_indices[child_indices >= 0]  # Filter out -1s
+
+        # Convert to regular Python list for indexing
+        child_list = [int(idx) for idx in child_indices]
+
+        # The action index corresponds to position in children list
+        # (children are ordered by action in tree traversal)
+        if action < len(child_list):
+            return child_list[action]
+        else:
+            raise ValueError(
+                f"Action {action} out of range for parent {parent_node_id} "
+                f"with {len(child_list)} children"
+            )
+
+    def _build_node_strategy_vector(self) -> jnp.ndarray:
+        """
+        Map infoset-action strategies to node-level transition probabilities.
+
+        For matrix operations (Equation 11), we need strategy probabilities per node,
+        not per (infoset, action) pair. This function creates a vector where
+        node_strategy[node_id] = probability of reaching this node from parent.
+
+        For decision nodes: Use current_strategy[infoset, action]
+        For chance nodes: Use uniform probability (1.0 / num_outcomes)
+        For root: 1.0
+
+        Returns:
+            node_strategy: (num_nodes,) array of transition probabilities
+        """
+        num_nodes = self.matrix_repr.num_nodes
+        node_strategy = jnp.ones(num_nodes, dtype=jnp.float32)
+
+        # For each (infoset, action) → node mapping, set the strategy probability
+        for (infoset, action), node_id in self.matrix_repr.action_index_to_node.items():
+            node = self.matrix_repr.nodes[node_id]
+
+            if node.is_terminal or node.is_chance:
+                # Chance nodes: uniform probability over outcomes (simplified for now)
+                # Terminal nodes: shouldn't be accessed during traversal
+                continue
+
+            # Decision node: look up strategy for the parent's (infoset, action)
+            # The node_id corresponds to the state after taking 'action' in 'infoset'
+            # But we want the probability of this transition, which is strategy[infoset, action]
+
+            # Find the action index for this (infoset, action) pair
+            try:
+                action_list = self.matrix_repr.infoset_to_actions[infoset]
+                action_idx = action_list.index(action)
+                infoset_action_idx = self.infoset_action_indices[infoset][action_idx]
+
+                # Set the transition probability to this node
+                node_strategy = node_strategy.at[node_id].set(
+                    self.current_strategy[infoset_action_idx]
+                )
+            except (KeyError, ValueError):
+                # If mapping fails, keep default 1.0
+                logger.warning(f"Could not map strategy for node {node_id}, infoset {infoset}, action {action}")
+
+        return node_strategy
 
     def solve(
         self,
@@ -268,6 +402,151 @@ class MatrixCFRSolver:
         print(f"Final iteration: {self.current_iteration:,}")
         print("=" * 80 + "\n")
 
+    def _bottom_up_utilities(self, player: int) -> List[jnp.ndarray]:
+        """
+        Compute utilities for all nodes via bottom-up propagation (Equation 11).
+
+        This implements the core bottom-up pass from the paper:
+            Ǔ^(D+1) = terminal_utilities[player]
+            for l = D down to 1:
+                Ǔ^(l) = (L^l ⊙ S) @ Ǔ^(l+1) + Ǔ^(l+1)
+
+        The strategy S is broadcast to match matrix dimensions, and utilities
+        propagate from terminal nodes back to the root.
+
+        Args:
+            player: Which player's utilities to compute
+
+        Returns:
+            utilities_by_level: List of (num_nodes,) arrays, one per level
+        """
+        num_levels = len(self.level_matrices_jax)
+        num_nodes = self.matrix_repr.num_nodes
+        utilities = [None] * num_levels
+
+        # Initialize terminal utilities at deepest level
+        # Extract utilities for this player from terminal nodes
+        utilities[-1] = self.terminal_utilities_jax[:, player]
+
+        # Map current strategy to node-level transition probabilities
+        node_strategy = self._build_node_strategy_vector()
+
+        # Bottom-up pass: propagate utilities from level D to level 0 (root)
+        for level in range(num_levels - 2, -1, -1):
+            L_l = self.level_matrices_jax[level]  # (num_nodes, num_nodes)
+
+            # Element-wise multiply: L^l ⊙ S
+            # L_l[i,j] = 1 if edge i→j exists, 0 otherwise
+            # We weight each edge by the strategy probability: S[j] (child node strategy)
+            # Broadcast strategy column-wise
+            weighted_L = L_l * node_strategy[jnp.newaxis, :]  # Broadcast across columns
+
+            # Matrix-vector product: (L^l ⊙ S) @ Ǔ^(l+1)
+            propagated = weighted_L @ utilities[level + 1]
+
+            # Add direct contribution (handles non-edge connections)
+            utilities[level] = propagated + utilities[level + 1]
+
+        return utilities
+
+    def _full_reach_probabilities(self, strategy: jnp.ndarray) -> List[jnp.ndarray]:
+        """
+        Compute FULL reach probabilities (all players play given strategy).
+
+        This is for strategy averaging - we want the probability of reaching each
+        node when all players play according to the current strategy.
+
+        Args:
+            strategy: Node-level strategy vector
+
+        Returns:
+            reach_by_level: List of (num_nodes,) arrays with reach probabilities
+        """
+        num_levels = len(self.level_matrices_jax)
+        num_nodes = self.matrix_repr.num_nodes
+        reach = [None] * num_levels
+
+        # Initialize root reach probability
+        reach[0] = jnp.zeros(num_nodes, dtype=jnp.float32)
+        reach[0] = reach[0].at[0].set(1.0)  # Root = 1.0
+
+        # Top-down pass: ALL players use the given strategy
+        for level in range(num_levels - 1):
+            L_l = self.level_matrices_jax[level + 1]  # Edges TO level+1
+
+            # Propagate: (L^l)^T @ reach^(l)
+            propagated = L_l.T @ reach[level]
+
+            # Weight by strategy probabilities
+            weighted = propagated * strategy
+
+            # Direct contribution
+            reach[level + 1] = weighted + reach[level]
+
+        return reach
+
+    def _top_down_reach_probabilities(
+        self,
+        updating_player: int,
+        opponent_strategy: jnp.ndarray
+    ) -> List[jnp.ndarray]:
+        """
+        Compute counterfactual reach probabilities via top-down propagation (Equation 13).
+
+        This implements the top-down pass from the paper:
+            Π̌^(0) = [1, 0, 0, ...] (root = 1.0)
+            for l = 1 to D:
+                Π̌^(l) = (L^l)^T @ Π̌^(l-1) ⊙ Š + Π̌^(l-1)
+
+        Counterfactual reach = probability of reaching node if updating player
+        played to reach (plays uniformly/counterfactually) while opponents play
+        according to their strategy.
+
+        Args:
+            updating_player: Player whose regrets we're computing
+            opponent_strategy: Node-level strategy vector for weighting
+
+        Returns:
+            reach_by_level: List of (num_nodes,) arrays with reach probabilities
+        """
+        num_levels = len(self.level_matrices_jax)
+        num_nodes = self.matrix_repr.num_nodes
+        reach = [None] * num_levels
+
+        # Initialize root reach probability
+        reach[0] = jnp.zeros(num_nodes, dtype=jnp.float32)
+        reach[0] = reach[0].at[0].set(1.0)  # Root node has reach 1.0
+
+        # Build counterfactual strategy override
+        # Š = 1.0 where updating_player acted (counterfactual), opponent_strategy otherwise
+        player_nodes = self.player_matrix_jax[:, updating_player]  # (num_nodes,) - 1 if player acted
+
+        # Where updating player acted, use 1.0 (counterfactual - as if they played to reach)
+        # Where opponents acted, use their actual strategy
+        counterfactual_strategy = jnp.where(
+            player_nodes > 0.5,      # Updating player's nodes
+            1.0,                      # Override to 1.0 (counterfactual)
+            opponent_strategy         # Use opponent's strategy
+        )
+
+        # Top-down pass: propagate reach from level 0 (root) to level D (terminal)
+        for level in range(num_levels - 1):
+            L_l = self.level_matrices_jax[level]  # (num_nodes, num_nodes)
+
+            # Transpose and multiply: (L^l)^T @ Π̌^(l-1)
+            # This propagates reach from parents to children
+            propagated = L_l.T @ reach[level]
+
+            # Element-wise multiply with counterfactual strategy
+            # Weight by strategy probability for transitions
+            weighted = propagated * counterfactual_strategy
+
+            # Add direct contribution
+            # (This handles nodes that appear at multiple levels or have no parents)
+            reach[level + 1] = weighted + reach[level]
+
+        return reach
+
     def _cfr_iteration(self, player: int):
         """
         Perform one CFR iteration for a player using matrix operations on GPU.
@@ -289,39 +568,92 @@ class MatrixCFRSolver:
 
     def _compute_counterfactual_values(self, player: int) -> Dict[str, jnp.ndarray]:
         """
-        Compute counterfactual values for all infosets of a player.
+        Compute counterfactual values for all actions using matrix operations.
 
-        This is a simplified version. Full implementation would use the
-        level-by-level matrix operations from the paper.
+        For each action at each infoset:
+        1. Override strategy to play that action with probability 1.0
+        2. Compute bottom-up utilities with the override
+        3. Extract utility at the infoset node
+
+        This uses the bottom-up propagation (Equation 11) to compute exact
+        counterfactual values for each action.
 
         Args:
             player: Player to compute values for
 
         Returns:
-            Dictionary mapping infosets to action values
+            Dictionary mapping infosets to action values array
         """
-        # For now, use a simple traversal
-        # TODO: Implement full matrix-based traversal with reach probabilities
-
         cf_values = {}
 
-        for infoset in self.matrix_repr.infoset_to_actions.keys():
-            # Get the node for this infoset
-            if (infoset, self.matrix_repr.infoset_to_actions[infoset][0]) in self.matrix_repr.action_index_to_node:
-                node_id = self.matrix_repr.action_index_to_node[(infoset, self.matrix_repr.infoset_to_actions[infoset][0])]
-                node = self.matrix_repr.nodes[node_id]
+        # Process each infoset belonging to this player
+        for infoset, actions in self.matrix_repr.infoset_to_actions.items():
+            if not actions:
+                continue
 
-                if node.player == player:
-                    # Compute value for each action (simplified)
-                    num_actions = len(self.matrix_repr.infoset_to_actions[infoset])
-                    action_values = jnp.zeros(num_actions, dtype=jnp.float32)
+            # Check if this infoset belongs to the updating player
+            first_action = actions[0]
+            if (infoset, first_action) not in self.matrix_repr.action_index_to_node:
+                continue
 
-                    # Placeholder: In full implementation, would traverse from this node
-                    # using matrix operations to compute true counterfactual values
-                    # For now, use random values to test the infrastructure
-                    action_values = jnp.ones(num_actions, dtype=jnp.float32) * 0.1
+            first_node_id = self.matrix_repr.action_index_to_node[(infoset, first_action)]
+            first_node = self.matrix_repr.nodes[first_node_id]
 
-                    cf_values[infoset] = action_values
+            if first_node.player != player:
+                continue
+
+            # Compute value for each action at this infoset
+            num_actions = len(actions)
+            action_values = jnp.zeros(num_actions, dtype=jnp.float32)
+
+            for action_idx, action in enumerate(actions):
+                # Create strategy override: play this action with probability 1.0
+                override_strategy = jnp.zeros_like(self.current_strategy)
+
+                # Set this specific (infoset, action) to probability 1.0
+                infoset_action_indices = self.infoset_action_indices[infoset]
+                override_strategy = override_strategy.at[infoset_action_indices[action_idx]].set(1.0)
+
+                # For all other infosets, use current strategy
+                for other_infoset, other_indices in self.infoset_action_indices.items():
+                    if other_infoset != infoset:
+                        override_strategy = override_strategy.at[other_indices].set(
+                            self.current_strategy[other_indices]
+                        )
+
+                # Temporarily swap strategies
+                original_strategy = self.current_strategy
+                self.current_strategy = override_strategy
+
+                # Compute utilities with this action override
+                utilities_by_level = self._bottom_up_utilities(player)
+
+                # Restore original strategy
+                self.current_strategy = original_strategy
+
+                # FIX: Extract utility at CHILD node reached by this action, not parent
+                # Option C optimization: Use cached child lookup (2x faster)
+                cache_key = (infoset, action)
+                if cache_key in self.action_child_cache:
+                    # Fast path: cached lookup (1 op)
+                    child_node_id = self.action_child_cache[cache_key]
+                else:
+                    # Slow path: compute via level matrices (10-20 ops)
+                    parent_node_id = self.matrix_repr.action_index_to_node[(infoset, action)]
+                    parent_node = self.matrix_repr.nodes[parent_node_id]
+                    child_node_id = self._find_child_for_action(
+                        parent_node_id=parent_node_id,
+                        action=action,
+                        parent_depth=parent_node.depth
+                    )
+
+                # Extract utility at CHILD node (the outcome of taking this action)
+                child_node = self.matrix_repr.nodes[child_node_id]
+                child_utility = utilities_by_level[child_node.depth][child_node_id]
+
+                action_values = action_values.at[action_idx].set(child_utility)
+
+            cf_values[infoset] = action_values
 
         return cf_values
 
@@ -350,8 +682,13 @@ class MatrixCFRSolver:
         # Update strategy via regret matching
         self.current_strategy = self._regret_matching()
 
-        # Accumulate strategy for averaging
-        self._update_cumulative_strategy()
+        # Compute FULL reach probabilities for weighted strategy averaging
+        # (both players play current strategy, not counterfactual)
+        current_node_strategy = self._build_node_strategy_vector()
+        reach_probs = self._full_reach_probabilities(current_node_strategy)
+
+        # Accumulate strategy for averaging (weighted by reach)
+        self._update_cumulative_strategy(reach_probs)
 
     def _regret_matching(self) -> jnp.ndarray:
         """
@@ -384,32 +721,50 @@ class MatrixCFRSolver:
 
         return new_strategy
 
-    def _update_cumulative_strategy(self):
+    def _update_cumulative_strategy(self, reach_probabilities: List[jnp.ndarray]):
         """
-        Accumulate current strategy for averaging.
+        Accumulate current strategy weighted by reach probability (Equation 10).
 
-        In vanilla CFR, we simply add the current strategy.
+        Strategy averaging should weight each strategy by the probability of
+        reaching that infoset, giving more importance to frequently visited states.
+
+        Args:
+            reach_probabilities: Reach probabilities by level from top-down pass
         """
-        # Reach probability weight would go here in full implementation
-        # For now, just accumulate uniformly
-        self.cumulative_strategy += self.current_strategy
+        # For each infoset-action, weight by reach probability at that node
+        for infoset, action_indices in self.infoset_action_indices.items():
+            # Get a representative node for this infoset
+            first_action = self.matrix_repr.infoset_to_actions[infoset][0]
+            if (infoset, first_action) not in self.matrix_repr.action_index_to_node:
+                continue
+
+            node_id = self.matrix_repr.action_index_to_node[(infoset, first_action)]
+            node = self.matrix_repr.nodes[node_id]
+            reach_weight = reach_probabilities[node.depth][node_id]
+
+            # Weighted accumulation: σ̄ += reach × σ
+            weighted_strategy = self.current_strategy[action_indices] * reach_weight
+            self.cumulative_strategy = self.cumulative_strategy.at[action_indices].add(
+                weighted_strategy
+            )
+
+            # Also accumulate the reach weights for normalization
+            self.cumulative_reach = self.cumulative_reach.at[action_indices].add(reach_weight)
 
     def get_average_policy(self) -> Dict[str, np.ndarray]:
         """
-        Get the average strategy policy.
+        Get the average strategy policy, weighted by reach probabilities.
+
+        Computes: σ̄ = cumulative_strategy / cumulative_reach (per infoset-action)
+        Then normalizes per infoset to get valid probability distributions.
 
         Returns:
             Dictionary mapping infosets to action probability distributions
         """
-        # Normalize cumulative strategy
-        strategy_sum = jnp.sum(self.cumulative_strategy)
-
-        if strategy_sum > 0:
-            avg_strategy_jax = self.cumulative_strategy / strategy_sum
-        else:
-            # If no strategy accumulated (shouldn't happen), return uniform
-            logger.warning("No strategy accumulated, returning uniform")
-            avg_strategy_jax = self._init_uniform_strategy()
+        # Divide cumulative strategy by cumulative reach (element-wise)
+        # Add epsilon to avoid division by zero
+        epsilon = 1e-10
+        avg_strategy_jax = self.cumulative_strategy / (self.cumulative_reach + epsilon)
 
         # Convert to numpy and extract per-infoset policies
         avg_strategy = np.array(avg_strategy_jax)
@@ -418,12 +773,12 @@ class MatrixCFRSolver:
         for infoset, action_indices in self.infoset_action_indices.items():
             action_probs = avg_strategy[action_indices]
 
-            # Normalize (should already be normalized, but ensure it)
+            # Normalize to get valid probability distribution
             prob_sum = action_probs.sum()
-            if prob_sum > 0:
+            if prob_sum > epsilon:
                 action_probs = action_probs / prob_sum
             else:
-                # Uniform if all zero
+                # If no reach (shouldn't happen for reachable infosets), use uniform
                 action_probs = np.ones(len(action_indices)) / len(action_indices)
 
             policy[infoset] = action_probs

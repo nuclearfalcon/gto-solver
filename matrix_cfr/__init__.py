@@ -24,15 +24,10 @@ __version__ = '0.1.0'
 __author__ = 'GTO Poker Training Project'
 
 # Import main classes when package is imported
-# (will be implemented in subsequent files)
-# from .matrix_cfr_solver import MatrixCFRSolver
-# from .game_to_matrix import GameTreeConverter
-# from .gpu_memory import GPUMemoryManager
-# from .validation import validate_against_cpu
+from .matrix_cfr_solver import MatrixCFRSolver
+from .game_to_matrix import GameTreeConverter
 
 __all__ = [
-    # 'MatrixCFRSolver',
-    # 'GameTreeConverter',
-    # 'GPUMemoryManager',
-    # 'validate_against_cpu',
+    'MatrixCFRSolver',
+    'GameTreeConverter',
 ]

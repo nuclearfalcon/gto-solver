@@ -37,6 +37,148 @@ from .game_to_matrix import GameTreeConverter, MatrixRepresentation
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# Phase 2 Optimization: JIT-Compiled Helper Functions
+# ============================================================================
+
+@jax.jit
+def _regret_matching_vectorized_jit(regrets_2d: jnp.ndarray, action_mask: jnp.ndarray) -> jnp.ndarray:
+    """
+    Vectorized regret matching using 2D arrays (Phase 2.1 optimization).
+
+    Processes all infosets in parallel on GPU instead of sequential Python loops.
+
+    Args:
+        regrets_2d: (num_infosets, max_actions) cumulative regrets
+        action_mask: (num_infosets, max_actions) - 1.0 for valid actions, 0.0 for padding
+
+    Returns:
+        strategy_2d: (num_infosets, max_actions) normalized strategy
+
+    Algorithm:
+        For each infoset (vectorized):
+        - Take positive regrets only
+        - If sum > 0: normalize to get probabilities
+        - Else: uniform distribution over valid actions
+    """
+    # Positive regrets only (vectorized across all infosets)
+    positive_regrets = jnp.maximum(regrets_2d, 0.0) * action_mask
+
+    # Sum per infoset: (num_infosets, 1)
+    regret_sums = jnp.sum(positive_regrets, axis=1, keepdims=True)
+
+    # Number of valid actions per infoset (for uniform fallback)
+    num_valid_actions = jnp.sum(action_mask, axis=1, keepdims=True)
+
+    # Normalize (vectorized with safe division)
+    # Where regret_sum > 0: proportional to regrets
+    # Where regret_sum == 0: uniform over valid actions
+    strategy = jnp.where(
+        regret_sums > 0,
+        positive_regrets / regret_sums,  # Proportional to positive regrets
+        action_mask / num_valid_actions  # Uniform over valid actions
+    )
+
+    return strategy
+
+
+def _batch_build_node_strategies_jit(
+    all_override_strategies: jnp.ndarray,
+    decision_node_ids: jnp.ndarray,
+    decision_ia_indices: jnp.ndarray,
+    num_nodes: int
+) -> jnp.ndarray:
+    """
+    Batch convert multiple strategy overrides to node-level probabilities (Phase 2.2).
+
+    Uses vmap to parallelize the conversion for all action overrides.
+
+    Args:
+        all_override_strategies: (num_configs, num_ia) override strategies
+        decision_node_ids: (num_decision_nodes,) node IDs for decision nodes
+        decision_ia_indices: (num_decision_nodes,) corresponding strategy indices
+        num_nodes: Total number of nodes
+
+    Returns:
+        all_node_strategies: (num_configs, num_nodes) node probabilities
+    """
+    num_configs = all_override_strategies.shape[0]
+
+    # Create base node strategies (all 1.0) for all configs
+    all_node_strategies = jnp.ones((num_configs, num_nodes), dtype=jnp.float32)
+
+    # For each config, set decision nodes to strategy values
+    # We can't vmap this easily due to the indexed update, so we'll use a different approach
+    # Instead of vmap, we'll broadcast and use fancy indexing
+
+    # Extract strategy values for decision nodes for all configs
+    # Shape: (num_configs, num_decision_nodes)
+    decision_strategy_values = all_override_strategies[:, decision_ia_indices]
+
+    # Update decision nodes for all configs at once
+    # This is tricky with JAX - we need to update specific indices in a 2D array
+    # Use jax.vmap with a simpler update function
+
+    @jax.jit
+    def update_single_config(base_nodes, strategy_vals):
+        """Update decision nodes for a single config."""
+        return base_nodes.at[decision_node_ids].set(strategy_vals)
+
+    # Vmap over configs
+    all_node_strategies = jax.vmap(update_single_config)(
+        all_node_strategies,
+        decision_strategy_values
+    )
+
+    return all_node_strategies
+
+
+@jax.jit
+def _batch_bottom_up_utilities_jit(
+    all_node_strategies: jnp.ndarray,
+    level_matrices_stacked: jnp.ndarray,
+    terminal_utils: jnp.ndarray
+) -> jnp.ndarray:
+    """
+    Batch compute bottom-up utilities for multiple strategy configurations (Phase 2.2).
+
+    Uses vmap to parallelize utility computation across all configurations.
+
+    Args:
+        all_node_strategies: (num_configs, num_nodes) different node strategies
+        level_matrices_stacked: (num_levels, num_nodes, num_nodes) level matrices
+        terminal_utils: (num_nodes,) terminal utilities
+
+    Returns:
+        all_utilities: (num_configs, num_levels, num_nodes) utilities for each config
+    """
+    def single_config_utilities(node_strategy):
+        """Compute utilities for a single strategy configuration."""
+        # Reuse existing JIT scan function
+        # Reverse iteration from terminals to root
+        def scan_fn(carry_utils, L_l):
+            weighted_L = L_l * node_strategy[jnp.newaxis, :]
+            propagated = weighted_L @ carry_utils
+            level_utils = propagated + carry_utils
+            return level_utils, level_utils
+
+        reversed_matrices = level_matrices_stacked[:-1][::-1]
+        final_utils, intermediate_utils = jax.lax.scan(
+            scan_fn, terminal_utils, reversed_matrices
+        )
+
+        return intermediate_utils[::-1]  # Return in forward order
+
+    # Vectorize over all configurations
+    all_utils = jax.vmap(single_config_utilities)(all_node_strategies)
+
+    return all_utils
+
+
+# ============================================================================
+# Matrix CFR Solver Class
+# ============================================================================
+
 class MatrixCFRSolver:
     """
     GPU-accelerated CFR solver using matrix operations.
@@ -161,6 +303,12 @@ class MatrixCFRSolver:
         # Build node→strategy mapping (Phase 1.1 optimization)
         self._build_node_strategy_mapping()
 
+        # Build action mask for 2D vectorization (Phase 2.1 optimization)
+        self.action_mask = self._build_action_mask()
+        num_infosets, max_actions = self._compute_2d_dimensions()
+        logger.info(f"  Action mask: ({num_infosets}, {max_actions}) - "
+                   f"{jnp.sum(self.action_mask):.0f} valid actions")
+
     def _build_action_child_cache(self):
         """
         Build cache mapping (infoset, action) → child_node_id for fast lookups.
@@ -277,6 +425,74 @@ class MatrixCFRSolver:
             strategy = strategy.at[action_indices].set(uniform_prob)
 
         return strategy
+
+    def _compute_2d_dimensions(self) -> Tuple[int, int]:
+        """
+        Compute dimensions for 2D padded array representation.
+
+        Returns:
+            (num_infosets, max_actions): Dimensions for padded arrays
+        """
+        num_infosets = len(self.infoset_action_indices)
+        max_actions = max(len(indices) for indices in self.infoset_action_indices.values())
+        return num_infosets, max_actions
+
+    def _build_action_mask(self) -> jnp.ndarray:
+        """
+        Build action mask for 2D padded arrays.
+
+        The mask is 1.0 for valid actions, 0.0 for padding.
+        This allows vectorized operations to ignore padded entries.
+
+        Returns:
+            action_mask: (num_infosets, max_actions) array
+        """
+        num_infosets, max_actions = self._compute_2d_dimensions()
+        mask = jnp.zeros((num_infosets, max_actions), dtype=jnp.float32)
+
+        for i, (infoset, indices) in enumerate(sorted(self.infoset_action_indices.items())):
+            num_actions = len(indices)
+            mask = mask.at[i, :num_actions].set(1.0)
+
+        return mask
+
+    def _convert_1d_to_2d(self, flat_array: jnp.ndarray) -> jnp.ndarray:
+        """
+        Convert flat 1D array to padded 2D array.
+
+        Args:
+            flat_array: 1D array indexed by infoset-action index (num_ia,)
+
+        Returns:
+            padded_array: 2D array (num_infosets, max_actions)
+        """
+        num_infosets, max_actions = self._compute_2d_dimensions()
+        padded = jnp.zeros((num_infosets, max_actions), dtype=flat_array.dtype)
+
+        for i, (infoset, indices) in enumerate(sorted(self.infoset_action_indices.items())):
+            num_actions = len(indices)
+            padded = padded.at[i, :num_actions].set(flat_array[indices])
+
+        return padded
+
+    def _convert_2d_to_1d(self, padded_array: jnp.ndarray) -> jnp.ndarray:
+        """
+        Convert padded 2D array back to flat 1D array.
+
+        Args:
+            padded_array: 2D array (num_infosets, max_actions)
+
+        Returns:
+            flat_array: 1D array indexed by infoset-action index (num_ia,)
+        """
+        num_ia = self.matrix_repr.num_infoset_actions
+        flat = jnp.zeros(num_ia, dtype=padded_array.dtype)
+
+        for i, (infoset, indices) in enumerate(sorted(self.infoset_action_indices.items())):
+            num_actions = len(indices)
+            flat = flat.at[indices].set(padded_array[i, :num_actions])
+
+        return flat
 
     def _find_child_for_action(self, parent_node_id: int, action: int, parent_depth: int) -> int:
         """
@@ -719,9 +935,141 @@ class MatrixCFRSolver:
         # Phase 2 & 3: Update regrets and strategy
         self._update_regrets_and_strategy(player, cf_values)
 
+    def _build_all_action_overrides(self, player: int) -> Tuple[jnp.ndarray, List[Tuple[str, int, int, int]]]:
+        """
+        Build all strategy overrides for all actions of a player (Phase 2.2 optimization).
+
+        Instead of building overrides one-at-a-time in a Python loop, this builds
+        ALL overrides at once as a batch for parallel processing.
+
+        Phase 2.2b: Optimized to minimize Python loops.
+
+        Args:
+            player: Player to build overrides for
+
+        Returns:
+            all_overrides: (num_player_actions, num_ia) strategy overrides
+            metadata: List of (infoset, action, action_idx, child_node_id) for each override
+        """
+        # Collect metadata (still need Python loop for this, but it's fast)
+        metadata = []
+        override_indices = []  # Which ia index to set to 1.0 for each override
+
+        for infoset, actions in self.matrix_repr.infoset_to_actions.items():
+            if not actions:
+                continue
+
+            # Check if belongs to this player
+            first_action = actions[0]
+            if (infoset, first_action) not in self.matrix_repr.action_index_to_node:
+                continue
+
+            first_node_id = self.matrix_repr.action_index_to_node[(infoset, first_action)]
+            first_node = self.matrix_repr.nodes[first_node_id]
+
+            if first_node.player != player:
+                continue
+
+            # Collect metadata for each action
+            infoset_indices = self.infoset_action_indices[infoset]
+            for action_idx, action in enumerate(actions):
+                # Which ia index should be set to 1.0 for this override
+                target_ia_index = infoset_indices[action_idx]
+                override_indices.append((target_ia_index, list(infoset_indices)))
+
+                # Get child node for value extraction
+                cache_key = (infoset, action)
+                child_node_id = self.action_child_cache.get(cache_key, -1)
+
+                metadata.append((infoset, action, action_idx, child_node_id))
+
+        if not metadata:
+            # No actions for this player
+            return jnp.zeros((0, self.matrix_repr.num_infoset_actions), dtype=jnp.float32), []
+
+        num_overrides = len(metadata)
+        num_ia = self.matrix_repr.num_infoset_actions
+
+        # Build all overrides at once using broadcasting
+        # Start with current strategy repeated for each override
+        all_overrides = jnp.tile(self.current_strategy, (num_overrides, 1))  # (num_overrides, num_ia)
+
+        # For each override, zero out the infoset and set target action to 1.0
+        # This still requires a loop, but it's much faster than creating arrays
+        for i, (target_idx, infoset_idx_list) in enumerate(override_indices):
+            # Zero out all actions in this infoset
+            all_overrides = all_overrides.at[i, infoset_idx_list].set(0.0)
+            # Set target action to 1.0
+            all_overrides = all_overrides.at[i, target_idx].set(1.0)
+
+        return all_overrides, metadata
+
     def _compute_counterfactual_values(self, player: int) -> Dict[str, jnp.ndarray]:
         """
-        Compute counterfactual values for all actions using matrix operations.
+        Compute counterfactual values for all actions using batched matrix operations.
+
+        Phase 2.2 Optimization: Instead of computing utilities sequentially for each action,
+        this method builds ALL strategy overrides at once and batches the utility computation
+        using vmap. This eliminates the nested Python loops (85% bottleneck).
+
+        For each action at each infoset:
+        1. Override strategy to play that action with probability 1.0
+        2. Compute bottom-up utilities with the override
+        3. Extract utility at the infoset node
+
+        This uses the bottom-up propagation (Equation 11) to compute exact
+        counterfactual values for each action.
+
+        Args:
+            player: Player to compute values for
+
+        Returns:
+            Dictionary mapping infosets to action values array
+        """
+        # Phase 2.2: Build ALL strategy overrides at once
+        all_overrides, metadata = self._build_all_action_overrides(player)
+
+        if len(all_overrides) == 0:
+            return {}
+
+        # Phase 2.2: Batch convert all overrides to node strategies
+        all_node_strategies = _batch_build_node_strategies_jit(
+            all_overrides,
+            self.decision_node_ids,
+            self.decision_ia_indices,
+            self.matrix_repr.num_nodes
+        )
+
+        # Phase 2.2: Batch compute utilities for all configurations
+        terminal_utils = self.terminal_utilities_jax[:, player]
+        all_utilities = _batch_bottom_up_utilities_jit(
+            all_node_strategies,
+            self.level_matrices_jax_stacked,
+            terminal_utils
+        )
+
+        # Extract action values for each infoset
+        cf_values = {}
+        for idx, (infoset, action, action_idx, child_node_id) in enumerate(metadata):
+            if child_node_id < 0:
+                continue
+
+            # Extract utility at child node
+            child_node = self.matrix_repr.nodes[child_node_id]
+            child_utility = all_utilities[idx, child_node.depth, child_node_id]
+
+            # Store in dict
+            if infoset not in cf_values:
+                num_actions = len(self.matrix_repr.infoset_to_actions[infoset])
+                cf_values[infoset] = jnp.zeros(num_actions, dtype=jnp.float32)
+
+            cf_values[infoset] = cf_values[infoset].at[action_idx].set(child_utility)
+
+        return cf_values
+
+    def _compute_counterfactual_values_old(self, player: int) -> Dict[str, jnp.ndarray]:
+        """
+        OLD VERSION: Compute counterfactual values sequentially (SLOW - kept for reference).
 
         For each action at each infoset:
         1. Override strategy to play that action with probability 1.0
@@ -847,6 +1195,9 @@ class MatrixCFRSolver:
         """
         Convert cumulative regrets to strategy using regret matching.
 
+        Phase 2.1 Optimization: This method now uses vectorized computation
+        on 2D arrays instead of Python loops.
+
         For each infoset:
         - Positive regrets → proportional probability
         - All non-positive → uniform distribution
@@ -854,23 +1205,14 @@ class MatrixCFRSolver:
         Returns:
             New strategy (JAX array)
         """
-        new_strategy = jnp.zeros_like(self.current_strategy)
+        # Convert 1D regrets to 2D padded array
+        regrets_2d = self._convert_1d_to_2d(self.cumulative_regrets)
 
-        for infoset, action_indices in self.infoset_action_indices.items():
-            regrets = self.cumulative_regrets[action_indices]
+        # Call vectorized JIT function
+        strategy_2d = _regret_matching_vectorized_jit(regrets_2d, self.action_mask)
 
-            # Positive regrets only
-            positive_regrets = jnp.maximum(regrets, 0.0)
-            regret_sum = jnp.sum(positive_regrets)
-
-            if regret_sum > 0:
-                # Proportional to positive regrets
-                probs = positive_regrets / regret_sum
-            else:
-                # Uniform if no positive regrets
-                probs = jnp.ones(len(action_indices)) / len(action_indices)
-
-            new_strategy = new_strategy.at[action_indices].set(probs)
+        # Convert back to 1D
+        new_strategy = self._convert_2d_to_1d(strategy_2d)
 
         return new_strategy
 

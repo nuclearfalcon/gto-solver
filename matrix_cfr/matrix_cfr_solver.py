@@ -189,7 +189,8 @@ class MatrixCFRSolver:
         self,
         iterations: int,
         checkpoint_interval: Optional[int] = None,
-        exploitability_interval: Optional[int] = None
+        exploitability_interval: Optional[int] = None,
+        progress_interval: int = 100
     ):
         """
         Run CFR for specified number of iterations on GPU.
@@ -198,10 +199,20 @@ class MatrixCFRSolver:
             iterations: Number of CFR iterations to run
             checkpoint_interval: Save checkpoint every N iterations
             exploitability_interval: Calculate exploitability every N iterations
+            progress_interval: Show progress update every N iterations (default: 100)
         """
-        logger.info(f"Starting {self.algorithm} solver for {iterations} iterations on {'GPU' if self.use_gpu else 'CPU'}")
+        print("\n" + "=" * 80)
+        print(f"MATRIX CFR SOLVER - {self.algorithm.upper()}")
+        print("=" * 80)
+        print(f"Game: {self.matrix_repr.num_nodes} nodes, {self.matrix_repr.num_infosets} infosets")
+        print(f"Players: {self.matrix_repr.num_players}")
+        print(f"Infoset-actions: {self.matrix_repr.num_infoset_actions}")
+        print(f"Device: {'GPU ('+str(self.device)+')' if self.use_gpu else 'CPU'}")
+        print(f"Target iterations: {iterations:,}")
+        print("=" * 80 + "\n")
 
         start_time = time.time()
+        last_update_time = start_time
 
         for i in range(iterations):
             self.current_iteration += 1
@@ -210,17 +221,52 @@ class MatrixCFRSolver:
             for player in range(self.matrix_repr.num_players):
                 self._cfr_iteration(player)
 
-            # Periodic logging
-            if (i + 1) % 1000 == 0:
-                elapsed = time.time() - start_time
+            # Periodic progress updates
+            if (i + 1) % progress_interval == 0:
+                current_time = time.time()
+                elapsed = current_time - start_time
                 it_per_sec = (i + 1) / elapsed
-                logger.info(f"Iteration {i + 1}/{iterations} ({it_per_sec:.0f} it/s)")
 
-            # TODO: Implement checkpointing
-            # TODO: Implement exploitability calculation
+                # Time since last update
+                interval_time = current_time - last_update_time
+                interval_its = progress_interval
+                interval_speed = interval_its / interval_time if interval_time > 0 else 0
+
+                # Estimated time remaining
+                remaining_its = iterations - (i + 1)
+                eta_seconds = remaining_its / it_per_sec if it_per_sec > 0 else 0
+                eta_mins = eta_seconds / 60
+
+                print(f"Iteration {i + 1:>10,}/{iterations:,} | "
+                      f"Speed: {interval_speed:>6.0f} it/s | "
+                      f"Avg: {it_per_sec:>6.0f} it/s | "
+                      f"Elapsed: {elapsed:>6.1f}s | "
+                      f"ETA: {eta_mins:>5.1f}m")
+
+                last_update_time = current_time
+
+            # Checkpointing
+            if checkpoint_interval and (i + 1) % checkpoint_interval == 0:
+                checkpoint_path = f"checkpoints/matrix_cfr_iter_{i + 1}.npz"
+                self.save_checkpoint(checkpoint_path)
+                print(f"  → Checkpoint saved: {checkpoint_path}")
+
+            # Exploitability calculation
+            if exploitability_interval and (i + 1) % exploitability_interval == 0:
+                # TODO: Implement proper exploitability
+                print(f"  → Exploitability check at iteration {i + 1} (not yet implemented)")
 
         total_time = time.time() - start_time
-        logger.info(f"Completed {iterations} iterations in {total_time:.2f}s ({iterations/total_time:.0f} it/s)")
+        final_speed = iterations / total_time
+
+        print("\n" + "=" * 80)
+        print("SOLVE COMPLETE")
+        print("=" * 80)
+        print(f"Total iterations: {iterations:,}")
+        print(f"Total time: {total_time:.2f}s ({total_time/60:.1f}m)")
+        print(f"Average speed: {final_speed:.0f} it/s")
+        print(f"Final iteration: {self.current_iteration:,}")
+        print("=" * 80 + "\n")
 
     def _cfr_iteration(self, player: int):
         """

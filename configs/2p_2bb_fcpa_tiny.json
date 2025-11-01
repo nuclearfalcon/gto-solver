@@ -1,0 +1,14 @@
+{
+  "num_players": 2,
+  "stack_sizes": [200, 200],
+  "blinds": [100, 50],
+  "betting_abstraction": "fcpa",
+  "num_rounds": 2,
+  "num_suits": 2,
+  "num_ranks": 3,
+  "num_hole_cards": 1,
+  "num_board_cards": "0 1",
+  "first_player": "1 1",
+  "betting_type": "nolimit",
+  "description": "2-player 2BB tiny Hold'em for testing (2 suits, 3 ranks, 1 hole card, 2 rounds)"
+}

@@ -132,6 +132,58 @@ sampled = solver.calculate_sampled_exploitability()  # Fast, memory-safe (DEFAUL
 
 **Supported algorithms:** `vanilla_cfr`, `cfr_plus`, `dcfr`, `lcfr`, `external_mccfr`, `outcome_mccfr`, `cpp_cfr`, `cpp_cfr_plus`
 
+### DCFR and LCFR-ES (Advanced)
+
+**Linear-Weighted External Sampling MCCFR (LCFR-ES)** combines external sampling with iteration weighting and optional regret discounting.
+
+**CRITICAL FINDING:** For **3+ player games**, use `external_mccfr` with **FULL averaging** instead of DCFR variants. Empirical testing on 3-player Kuhn poker (1M iterations) showed FULL averaging significantly outperforms all DCFR configurations.
+
+#### Algorithm Performance (3-player Kuhn, 1M iterations)
+
+| Rank | Algorithm | Best Nash Conv | Recommendation |
+|------|-----------|----------------|----------------|
+| 🥇 | **FULL** | **0.001109** | **USE THIS for 3+ players** |
+| 🥈 | True LCFR | 0.001601 | Research/comparison only |
+| 🥉 | CFR+ Approx | 0.002737 | Not recommended |
+| 4. | SOTA DCFR | 0.004339 | Underperforms on 3p games |
+| 5. | SIMPLE | 0.024478 | Baseline only |
+
+#### Recommended Usage
+
+**For 3+ player poker (RECOMMENDED):**
+```python
+from open_spiel.python.algorithms import external_sampling_mccfr
+
+solver = external_sampling_mccfr.ExternalSamplingSolver(
+    game,
+    average_type=external_sampling_mccfr.AverageType.FULL  # Best for 3+ players
+)
+```
+
+**For research/testing DCFR:**
+```python
+from linear_external_mccfr import LinearExternalSamplingSolver
+
+# SOTA DCFR(1.5, 0, 2) - Research best for 2-player
+solver = LinearExternalSamplingSolver(game, gamma=2.0, alpha=1.5, beta=0.0)
+
+# True LCFR(1, 1, 1) - Original Linear CFR
+solver = LinearExternalSamplingSolver(game, gamma=1.0, alpha=1.0, beta=1.0)
+```
+
+**DCFR Parameters:**
+- **γ (gamma):** Strategy averaging weight exponent (0=uniform, 1=linear, 2=quadratic)
+- **α (alpha):** Positive regret discount exponent (None=no discount)
+- **β (beta):** Negative regret discount exponent (None=no discount, **0=no discount NOT 0.5**)
+
+**IMPORTANT:** β=0 means "no discounting" (multiply by 1.0), NOT the formula result of 0.5. See `DCFR_BUGS_AND_FIXES.md` for critical implementation details.
+
+**Documentation:**
+- `DCFR_GUIDE.md` - Algorithm selection guide and parameter explanations
+- `DCFR_BUGS_AND_FIXES.md` - Critical bugs discovered and fixed during validation
+- `linear_external_mccfr.py` - LCFR-ES implementation
+- `compare_dcfr_research_3p_parallel.py` - Parallel validation script
+
 ### Sampled Exploitability (DEFAULT)
 
 **CRITICAL:** Sampled exploitability is now the **DEFAULT** for all solving. Full exploitability causes massive memory usage and should NEVER be used except for tiny test games.

@@ -59,10 +59,22 @@ result = calc.calculate(
 - `cfr_plus`: Python CFR+
 - `dcfr`: Python Discounted CFR
 - `lcfr`: Python Linear CFR
-- `external_mccfr`: External Sampling MCCFR
+- `external_mccfr`: External Sampling MCCFR (SIMPLE or FULL averaging)
 - `outcome_mccfr`: Outcome Sampling MCCFR
 - `cpp_cfr`: C++ CFR
 - `cpp_cfr_plus`: C++ CFR+
+- `linear_external_mccfr`: Linear-Weighted External Sampling MCCFR with DCFR(α,β,γ) parameterization
+
+**Algorithm Selection for 3+ Players**:
+
+For 3+ player poker training, empirical validation (1M iterations on 3-player Kuhn poker) shows:
+- **FULL averaging** (0.001109 Nash conv) significantly outperforms all DCFR variants
+- **SIMPLE averaging** (0.024478 Nash conv) is 2107% worse
+- DCFR(1.5, 0, 2) from research (0.004339 Nash conv) ranks 4th for 3+ players
+
+**Recommendation**: Use External Sampling MCCFR with **FULL** averaging for 3+ player games.
+
+See `DCFR_GUIDE.md` for complete algorithm selection guide and performance data.
 
 **Usage**:
 ```python
@@ -85,7 +97,49 @@ exploit = solver.calculate_exploitability()  # Full exploitability
 sampled_exploit = solver.calculate_sampled_exploitability()  # Sampled
 ```
 
-### 3. Game Configuration
+### 3. DCFR/LCFR-ES Implementation
+**Module**: `linear_external_mccfr.py`
+**Primary Class**: `LinearExternalSamplingSolver`
+
+**Purpose**: Linear-Weighted External Sampling MCCFR with full DCFR(α,β,γ) parameterization for 3+ player games.
+
+**Key Features**:
+- External Sampling ensures all branches are trained (required for 3+ players)
+- Configurable discounting parameters (α, β, γ)
+- Research-validated configurations: LCFR(1,1,1), SOTA DCFR(1.5,0,2), CFR+ Approx
+- Checkpoint save/resume support
+- Three critical bugs fixed (see `DCFR_BUGS_AND_FIXES.md`)
+
+**DCFR Parameters**:
+- **α (alpha)**: Positive regret discounting exponent
+- **β (beta)**: Negative regret discounting exponent (β=0 means NO discount, not 0.5)
+- **γ (gamma)**: Strategy averaging weighting exponent
+
+**Usage**:
+```python
+from linear_external_mccfr import LinearExternalSamplingSolver
+
+# True LCFR (linear weighting)
+solver = LinearExternalSamplingSolver(game, gamma=1.0, alpha=1.0, beta=1.0)
+
+# SOTA DCFR from research
+solver = LinearExternalSamplingSolver(game, gamma=2.0, alpha=1.5, beta=0.0)
+
+# Run iterations
+for i in range(iterations):
+    solver.iteration()
+
+# Get policy
+policy = solver.average_policy()
+```
+
+**Important Notes**:
+- For 3+ players, **External Sampling MCCFR with FULL averaging** outperforms all DCFR variants
+- DCFR research focused on 2-player games; results may not generalize to 3+ players
+- Non-monotonic convergence is expected (track best Nash, not final Nash)
+- See `DCFR_GUIDE.md` for algorithm selection and performance data
+
+### 4. Game Configuration
 **Module**: `game_config.py`
 **Primary Class**: `PokerGameConfig`
 
@@ -111,7 +165,7 @@ game = config.create_game()
 openspiel_config = config.to_openspiel_config()
 ```
 
-### 4. Metrics Tracking
+### 5. Metrics Tracking
 **Module**: `solver_metrics.py`
 **Primary Classes**: `MetricsTracker`, `AdaptiveSchedule`
 
@@ -145,7 +199,7 @@ tracker.save_csv('results/metrics.csv')
 tracker.save_json('results/summary.json')
 ```
 
-### 5. Logging
+### 6. Logging
 **Module**: `solver_logger.py`
 **Primary Classes**: `SolverLogger`, `ComparisonLogger`
 
@@ -165,7 +219,7 @@ logger.log_iteration(iteration=1000, exploit=0.5)
 logger.log_exploitability_check(exploit=0.5, time_elapsed=60)
 ```
 
-### 6. Test Utilities
+### 7. Test Utilities
 **Module**: `test_utils.py`
 
 **Purpose**: Common utilities for test scripts.
@@ -201,6 +255,7 @@ print(f"Memory increased by {monitor.memory_increase:.2f} MB")
 | `solver_metrics.py` | Metrics tracking | `MetricsTracker`, `AdaptiveSchedule` |
 | `solver_logger.py` | Logging | `SolverLogger`, `ComparisonLogger` |
 | `betting_abstraction.py` | Betting abstractions | `BettingAbstraction` |
+| `linear_external_mccfr.py` | DCFR/LCFR-ES algorithms | `LinearExternalSamplingSolver` |
 | `test_utils.py` | Test utilities | `get_memory_mb()`, `MemoryMonitor` |
 
 ## Usage Guidelines
@@ -362,6 +417,14 @@ Game configurations should:
 4. Be validated by `PokerGameConfig` on load
 
 ## Version History
+
+- **v1.1.0** (2025-11-01): DCFR/LCFR-ES implementation and validation
+  - Added `linear_external_mccfr.py` module with DCFR(α,β,γ) parameterization
+  - Fixed three critical bugs in DCFR implementation (see `DCFR_BUGS_AND_FIXES.md`)
+  - Validated algorithms on 3-player Kuhn poker (1M iterations)
+  - Documented algorithm selection for 3+ players (FULL averaging recommended)
+  - Created `DCFR_GUIDE.md` with performance data and selection guide
+  - Added parallel validation framework for algorithm comparison
 
 - **v1.0.0** (2025-10-29): Initial architecture documentation
   - Established single sources of truth

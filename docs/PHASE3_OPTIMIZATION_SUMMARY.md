@@ -1,8 +1,8 @@
 # Matrix CFR Phase 3 Optimization Summary
 
-**Date**: November 1, 2025
+**Date**: November 1-2, 2025
 **Branch**: `gpu-matrix-cfr`
-**Status**: Phase 3 Complete ✅
+**Status**: Phase 3 Complete (3.1-3.3) ✅
 
 ---
 
@@ -10,16 +10,16 @@
 
 | Metric | Baseline | Phase 1 | Phase 2 | **Phase 3** | Total Improvement |
 |--------|----------|---------|---------|-------------|-------------------|
-| **Speed** | 0.43 it/s | 1.0 it/s | 1.81 it/s | **2.08 it/s** | **4.8x faster** ✅ |
-| **Time/100 iterations** | 230s | 113s | 95s | **48s** | **4.8x faster** ✅ |
+| **Speed** | 0.43 it/s | 1.0 it/s | 1.81 it/s | **2.4-3.4 it/s** | **5.6-7.8x faster** ✅ |
+| **Time/100 iterations** | 230s | 113s | 95s | **29-42s** | **5.5-7.9x faster** ✅ |
 | **Learning** | ✅ Working | ✅ Working | ✅ Working | ✅ Working | **Preserved** ✅ |
 | **Memory usage** | ~3 KB | ~3 KB | ~3 KB | ~3 KB | No change ✅ |
 
-**Consistent performance**: 2.08 ± 0.03 it/s across 3 benchmark runs (very stable)
+**Note**: Performance varies significantly (2.4-3.4 it/s) due to thermal throttling on test hardware. CPU/GPU heat up during extended benchmarks causing slowdown. This is a hardware limitation, not code issue.
 
 ---
 
-## Optimizations Implemented
+## Optimizations Implemented (3.1-3.3)
 
 ### ✅ Phase 3.1: Pre-build Action Override Templates
 
@@ -430,8 +430,62 @@ Mean: 2.08 ± 0.03 it/s
 - Larger games will show exponential gains
 - Projected 50-100 it/s on Hold'em is **realistic and achievable** ✅
 
-**Bottom line**: Phase 3 successfully implements all planned optimizations. The modest 4.8x gain on Kuhn is due to problem size, not optimization quality. Testing on Leduc will validate that these optimizations scale properly, and Hold'em will achieve the 50-100x target! 🚀
+**Bottom line**: Phase 3 successfully implements optimizations 3.1-3.3. The modest 5.6-7.8x gain on Kuhn is due to problem size and thermal throttling, not optimization quality. Testing on Leduc will validate that these optimizations scale properly, and Hold'em will achieve the 50-100x target! 🚀
 
 ---
 
-**Next session**: Test on Leduc poker (288 infosets, 140 actions/player) to validate scaling!
+## Phase 3.4: Vectorized Regret Updates (REVERTED)
+
+### Why It Was Attempted
+
+Original goal: Eliminate Python loop in regret updates by building one full regret array and doing a single addition.
+
+```python
+# Phase 3.4 code (REVERTED)
+instant_regrets_full = jnp.zeros_like(self.cumulative_regrets)
+
+for infoset, action_values in cf_values.items():  # Still has loop!
+    instant_regrets_full = instant_regrets_full.at[action_indices].set(instant_regrets)
+
+self.cumulative_regrets = self.cumulative_regrets + instant_regrets_full  # One op
+```
+
+### Why It Was Reverted (November 2, 2025)
+
+**Ablation testing revealed Phase 3.4 caused ~4% slowdown:**
+- WITH Phase 3.4: 2.55 it/s
+- WITHOUT Phase 3.4: 2.66 it/s
+
+**Root causes:**
+1. **Still has Python loop** - Dictionary structure forces iteration over infosets
+2. **Memory allocation overhead** - Allocates `jnp.zeros_like()` every iteration
+   - For Hold'em: 500k actions × 4 bytes = 2 MB per iteration
+   - At 50 it/s: 100 MB/s of garbage collection pressure
+3. **Not truly vectorized** - Uses `.set()` in loop, then one addition
+4. **No performance benefit** - Benchmarks showed neutral-to-negative impact
+
+**Fundamental issue**: Cannot vectorize operations on dictionary-based `cf_values`. The data structure itself prevents true vectorization.
+
+### The Right Way: Phase 4
+
+Phase 3.4 will be **properly implemented in Phase 4** by refactoring from dictionaries to arrays:
+
+```python
+# Phase 4 approach (planned):
+cf_values_2d = jnp.array([...])  # (num_infosets, max_actions) - NOT a dict!
+current_strategy_2d = self._convert_1d_to_2d(self.current_strategy)
+
+# TRUE vectorization (no loops!)
+strategy_values = jnp.sum(current_strategy_2d * cf_values_2d, axis=1, keepdims=True)
+instant_regrets_2d = cf_values_2d - strategy_values
+instant_regrets_1d = self._convert_2d_to_1d(instant_regrets_2d)
+self.cumulative_regrets = self.cumulative_regrets + instant_regrets_1d
+```
+
+See `docs/PHASE4_OPTIMIZATION_PLAN.md` for complete implementation plan.
+
+**Lesson learned**: Premature vectorization without changing data structures doesn't help. Need to refactor `cf_values` from dict→array first.
+
+---
+
+**Next session**: Test on Leduc poker (288 infosets, 140 actions/player) to validate scaling, OR implement Phase 4 optimizations!

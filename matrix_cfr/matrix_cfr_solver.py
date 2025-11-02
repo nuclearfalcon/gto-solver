@@ -175,6 +175,50 @@ def _batch_bottom_up_utilities_jit(
     return all_utils
 
 
+@jax.jit
+def _single_sparse_bottom_up(
+    level_matrices_list: list,
+    terminal_utils: jnp.ndarray,
+    node_strategy: jnp.ndarray
+) -> jnp.ndarray:
+    """JIT-compiled single configuration sparse bottom-up utilities."""
+    reversed_utils, _ = MatrixCFRSolver._bottom_up_scan_sparse(
+        level_matrices_list,
+        terminal_utils,
+        node_strategy
+    )
+    return jnp.stack(reversed_utils)
+
+
+def _batch_bottom_up_utilities_sparse(
+    all_node_strategies: jnp.ndarray,
+    level_matrices_list: list,
+    terminal_utils: jnp.ndarray
+) -> jnp.ndarray:
+    """
+    Phase 5: Batch compute bottom-up utilities for sparse BCOO matrices.
+
+    Args:
+        all_node_strategies: (num_configs, num_nodes) different node strategies
+        level_matrices_list: List of BCOO sparse matrices (varying nse per level)
+        terminal_utils: (num_nodes,) terminal utilities
+
+    Returns:
+        all_utilities: (num_configs, num_levels, num_nodes) utilities for each config
+    """
+    num_configs = all_node_strategies.shape[0]
+    all_utils = []
+
+    # Process each configuration separately with JIT-compiled function
+    for config_idx in range(num_configs):
+        node_strategy = all_node_strategies[config_idx]
+        utils = _single_sparse_bottom_up(level_matrices_list, terminal_utils, node_strategy)
+        all_utils.append(utils)
+
+    # Stack all configs
+    return jnp.stack(all_utils)
+
+
 # ============================================================================
 # Matrix CFR Solver Class
 # ============================================================================
@@ -191,7 +235,8 @@ class MatrixCFRSolver:
         self,
         game: pyspiel.Game,
         algorithm: str = 'vanilla_cfr',
-        use_gpu: bool = True
+        use_gpu: bool = True,
+        use_sparse: bool = True
     ):
         """
         Initialize matrix-based CFR solver.
@@ -200,10 +245,12 @@ class MatrixCFRSolver:
             game: OpenSpiel game instance
             algorithm: CFR variant ('vanilla_cfr', 'mccfr', 'dcfr')
             use_gpu: Whether to use GPU acceleration (auto-detected if available)
+            use_sparse: Whether to use sparse matrices (required for Leduc/Hold'em)
         """
         self.game = game
         self.algorithm = algorithm
         self.use_gpu = use_gpu
+        self.use_sparse = use_sparse
 
         # Initialize JAX/GPU first
         self._init_gpu()
@@ -244,24 +291,47 @@ class MatrixCFRSolver:
         """
         Convert scipy sparse matrices to JAX arrays and transfer to GPU.
 
-        Note: JAX sparse support is experimental, so we'll use dense arrays
-        for now and optimize later with proper sparse operations.
+        Phase 5: Supports both sparse (BCOO) and dense representations.
+        - Sparse: Required for Leduc/Hold'em (>1000 nodes)
+        - Dense: Faster for tiny games like Kuhn (<100 nodes)
         """
-        # Convert level matrices to a stacked 3D array for JIT compatibility
-        # Shape: (num_levels, num_nodes, num_nodes)
-        level_arrays = [L.toarray() for L in self.matrix_repr.level_matrices]
-        self.level_matrices_jax_stacked = jnp.array(level_arrays, dtype=jnp.float32)
+        if self.use_sparse:
+            # Phase 5: BCOO sparse representation
+            # Memory: Leduc 0.36 MB (sparse) vs 2.67 GB (dense)
+            logger.info("Converting to BCOO sparse matrices...")
 
-        # Also keep list version for non-JIT methods if needed
-        self.level_matrices_jax = [
-            jnp.array(L.toarray(), dtype=jnp.float32)
-            for L in self.matrix_repr.level_matrices
-        ]
+            # Convert level matrices to BCOO (list form for easy indexing)
+            self.level_matrices_jax = [
+                jsparse.BCOO.from_scipy_sparse(L)
+                for L in self.matrix_repr.level_matrices
+            ]
 
-        self.infoset_action_matrix_jax = jnp.array(
-            self.matrix_repr.infoset_action_to_node_matrix.toarray(),
-            dtype=jnp.float32
-        )
+            # Convert infoset-action matrix to BCOO
+            self.infoset_action_matrix_jax = jsparse.BCOO.from_scipy_sparse(
+                self.matrix_repr.infoset_action_to_node_matrix
+            )
+
+            # Phase 5: No dense stacked matrices needed - batch code now uses sparse!
+
+        else:
+            # Phase 1-4: Dense representation (legacy path)
+            logger.info("Converting to dense matrices...")
+
+            # Convert level matrices to a stacked 3D array for JIT compatibility
+            # Shape: (num_levels, num_nodes, num_nodes)
+            level_arrays = [L.toarray() for L in self.matrix_repr.level_matrices]
+            self.level_matrices_jax_stacked = jnp.array(level_arrays, dtype=jnp.float32)
+
+            # Also keep list version for non-JIT methods if needed
+            self.level_matrices_jax = [
+                jnp.array(L.toarray(), dtype=jnp.float32)
+                for L in self.matrix_repr.level_matrices
+            ]
+
+            self.infoset_action_matrix_jax = jnp.array(
+                self.matrix_repr.infoset_action_to_node_matrix.toarray(),
+                dtype=jnp.float32
+            )
 
         self.player_matrix_jax = jnp.array(
             self.matrix_repr.player_matrix,
@@ -737,6 +807,10 @@ class MatrixCFRSolver:
 
         L_l = self.level_matrices_jax[child_depth]  # Edges TO depth child_depth
 
+        # Phase 5: Convert sparse to dense for indexing operations (initialization only)
+        if self.use_sparse:
+            L_l = L_l.todense()
+
         # Find all children of parent_node_id
         # L_l[parent_node_id, :] gives edges from parent to all possible children
         parent_row = L_l[parent_node_id, :]
@@ -907,12 +981,21 @@ class MatrixCFRSolver:
         # Map current strategy to node-level transition probabilities
         node_strategy = self._build_node_strategy_vector()
 
-        # Use JIT-compiled scan for bottom-up propagation
-        reversed_utils, final_utils = self._bottom_up_scan_jit(
-            self.level_matrices_jax_stacked,
-            terminal_utils,
-            node_strategy
-        )
+        # Phase 5: Use sparse or dense variant based on configuration
+        if self.use_sparse:
+            # Sparse BCOO path
+            reversed_utils, final_utils = self._bottom_up_scan_sparse(
+                self.level_matrices_jax,
+                terminal_utils,
+                node_strategy
+            )
+        else:
+            # Dense path (Phase 1-4)
+            reversed_utils, final_utils = self._bottom_up_scan_jit(
+                self.level_matrices_jax_stacked,
+                terminal_utils,
+                node_strategy
+            )
 
         # Construct list from JAX arrays (outside JIT)
         num_levels = len(self.level_matrices_jax)
@@ -973,6 +1056,51 @@ class MatrixCFRSolver:
         # Return JAX arrays (list construction happens outside JIT)
         return reversed_utils, final_utils
 
+    @staticmethod
+    def _bottom_up_scan_sparse(level_matrices_list, terminal_utils, node_strategy):
+        """
+        Phase 5: Sparse variant using BCOO matrices.
+
+        Note: Uses Python for-loop instead of jax.lax.scan because BCOO matrices
+        have varying sparsity patterns (different nse per level).
+
+        Args:
+            level_matrices_list: List of BCOO matrices (one per level)
+            terminal_utils: Utilities at terminal level
+            node_strategy: Node-level strategy probabilities
+
+        Returns:
+            List of utilities for each level
+        """
+        num_levels = len(level_matrices_list)
+
+        # Initialize with terminal utilities
+        carry_utils = terminal_utils
+        utilities_list = []
+
+        # Reverse level matrices (bottom-up processing)
+        # Skip the terminal level since we start from terminals
+        reversed_matrices = level_matrices_list[:-1][::-1]
+
+        # Python for-loop (sparse matrices have varying nse, can't use scan)
+        for L_l_bcoo in reversed_matrices:
+            # Element-wise multiply: BCOO supports broadcasting
+            weighted_L = L_l_bcoo * node_strategy[jnp.newaxis, :]
+
+            # Sparse matrix @ dense vector product
+            propagated = weighted_L @ carry_utils
+
+            # Compute utilities for this level
+            level_utils = propagated + carry_utils
+
+            utilities_list.append(level_utils)
+            carry_utils = level_utils
+
+        # Reverse to get correct order [level_0, ..., level_{D-1}]
+        utilities_list = utilities_list[::-1]
+
+        return utilities_list, carry_utils
+
     def _full_reach_probabilities(self, strategy: jnp.ndarray) -> List[jnp.ndarray]:
         """
         Compute FULL reach probabilities (all players play given strategy).
@@ -994,12 +1122,21 @@ class MatrixCFRSolver:
         # Initialize root reach probability
         root_reach = jnp.zeros(num_nodes, dtype=jnp.float32).at[0].set(1.0)
 
-        # Use JIT-compiled scan for top-down propagation
-        intermediate_reach, final_reach = self._full_reach_scan_jit(
-            self.level_matrices_jax_stacked,
-            root_reach,
-            strategy
-        )
+        # Phase 5: Use sparse or dense variant based on configuration
+        if self.use_sparse:
+            # Sparse BCOO path
+            intermediate_reach, final_reach = self._full_reach_scan_sparse(
+                self.level_matrices_jax,
+                root_reach,
+                strategy
+            )
+        else:
+            # Dense path (Phase 1-4)
+            intermediate_reach, final_reach = self._full_reach_scan_jit(
+                self.level_matrices_jax_stacked,
+                root_reach,
+                strategy
+            )
 
         # Construct list from JAX arrays (outside JIT)
         num_levels = len(self.level_matrices_jax)
@@ -1047,6 +1184,45 @@ class MatrixCFRSolver:
         # Return JAX arrays (list construction happens outside JIT)
         return intermediate_reach, final_reach
 
+    @staticmethod
+    def _full_reach_scan_sparse(level_matrices_list, root_reach, strategy):
+        """
+        Phase 5: Sparse variant of full reach propagation using BCOO matrices.
+
+        Note: Uses Python for-loop instead of jax.lax.scan because BCOO matrices
+        have varying sparsity patterns.
+
+        Args:
+            level_matrices_list: List of BCOO matrices (one per level)
+            root_reach: Initial reach at root
+            strategy: Node-level strategy probabilities
+
+        Returns:
+            List of reach probabilities for each level
+        """
+        # Initialize with root reach
+        carry_reach = root_reach
+        reach_list = []
+
+        # Get level matrices for propagation (skip first since we start from root)
+        forward_matrices = level_matrices_list[1:]
+
+        # Python for-loop (sparse matrices have varying nse, can't use scan)
+        for L_l_bcoo in forward_matrices:
+            # Sparse transpose @ dense vector
+            propagated = L_l_bcoo.T @ carry_reach
+
+            # Weight by strategy probabilities
+            weighted = propagated * strategy
+
+            # Direct contribution
+            next_reach = weighted + carry_reach
+
+            reach_list.append(next_reach)
+            carry_reach = next_reach
+
+        return reach_list, carry_reach
+
     def _top_down_reach_probabilities(
         self,
         updating_player: int,
@@ -1083,12 +1259,21 @@ class MatrixCFRSolver:
             opponent_strategy         # Use opponent's strategy
         )
 
-        # Use JIT-compiled scan for top-down propagation
-        intermediate_reach, final_reach = self._counterfactual_reach_scan_jit(
-            self.level_matrices_jax_stacked,
-            root_reach,
-            counterfactual_strategy
-        )
+        # Phase 5: Use sparse or dense variant based on configuration
+        if self.use_sparse:
+            # Sparse BCOO path
+            intermediate_reach, final_reach = self._counterfactual_reach_scan_sparse(
+                self.level_matrices_jax,
+                root_reach,
+                counterfactual_strategy
+            )
+        else:
+            # Dense path (Phase 1-4)
+            intermediate_reach, final_reach = self._counterfactual_reach_scan_jit(
+                self.level_matrices_jax_stacked,
+                root_reach,
+                counterfactual_strategy
+            )
 
         # Construct list from JAX arrays (outside JIT)
         num_levels = len(self.level_matrices_jax)
@@ -1135,6 +1320,45 @@ class MatrixCFRSolver:
 
         # Return JAX arrays (list construction happens outside JIT)
         return intermediate_reach, final_reach
+
+    @staticmethod
+    def _counterfactual_reach_scan_sparse(level_matrices_list, root_reach, counterfactual_strategy):
+        """
+        Phase 5: Sparse variant of counterfactual reach propagation using BCOO matrices.
+
+        Note: Uses Python for-loop instead of jax.lax.scan because BCOO matrices
+        have varying sparsity patterns.
+
+        Args:
+            level_matrices_list: List of BCOO matrices (one per level)
+            root_reach: Initial reach at root
+            counterfactual_strategy: Strategy with updating player set to 1.0
+
+        Returns:
+            List of reach probabilities for each level
+        """
+        # Initialize with root reach
+        carry_reach = root_reach
+        reach_list = []
+
+        # Get level matrices for propagation (skip last since we don't need terminal level)
+        forward_matrices = level_matrices_list[:-1]
+
+        # Python for-loop (sparse matrices have varying nse, can't use scan)
+        for L_l_bcoo in forward_matrices:
+            # Sparse transpose @ dense vector
+            propagated = L_l_bcoo.T @ carry_reach
+
+            # Weight by counterfactual strategy
+            weighted = propagated * counterfactual_strategy
+
+            # Direct contribution
+            next_reach = weighted + carry_reach
+
+            reach_list.append(next_reach)
+            carry_reach = next_reach
+
+        return reach_list, carry_reach
 
     def _cfr_iteration(self, player: int):
         """
@@ -1196,17 +1420,31 @@ class MatrixCFRSolver:
         terminal_utils_p0 = self.terminal_utilities_jax[:, 0]
         terminal_utils_p1 = self.terminal_utilities_jax[:, 1]
 
-        all_utilities_p0 = _batch_bottom_up_utilities_jit(
-            all_node_strategies,
-            self.level_matrices_jax_stacked,
-            terminal_utils_p0
-        )
+        # Phase 5: Use sparse or dense batch utilities
+        if self.use_sparse:
+            all_utilities_p0 = _batch_bottom_up_utilities_sparse(
+                all_node_strategies,
+                self.level_matrices_jax,
+                terminal_utils_p0
+            )
 
-        all_utilities_p1 = _batch_bottom_up_utilities_jit(
-            all_node_strategies,
-            self.level_matrices_jax_stacked,
-            terminal_utils_p1
-        )
+            all_utilities_p1 = _batch_bottom_up_utilities_sparse(
+                all_node_strategies,
+                self.level_matrices_jax,
+                terminal_utils_p1
+            )
+        else:
+            all_utilities_p0 = _batch_bottom_up_utilities_jit(
+                all_node_strategies,
+                self.level_matrices_jax_stacked,
+                terminal_utils_p0
+            )
+
+            all_utilities_p1 = _batch_bottom_up_utilities_jit(
+                all_node_strategies,
+                self.level_matrices_jax_stacked,
+                terminal_utils_p1
+            )
 
         # Extract counterfactual values for each player (Phase 4.1: vectorized extraction)
         cf_values_p0 = self._extract_cf_values_from_utilities(

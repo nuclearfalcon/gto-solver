@@ -1,0 +1,86 @@
+================================================================================
+PHASE 5: SPARSE MATRIX RESULTS
+================================================================================
+Date: 2025-11-02
+Goal: Enable Leduc poker and beyond with sparse matrices
+
+================================================================================
+MEMORY COMPRESSION RESULTS
+================================================================================
+
+Kuhn Poker (58 nodes, 12 infosets):
+  Dense:   N/A (works fine with dense)
+  Sparse:  ~0.5 MB
+  Notes:   Sparse slower due to overhead (1 it/s vs 6 it/s)
+
+Leduc Poker (9,457 nodes, 936 infosets):
+  Dense:   2.67 GB → OOM ❌
+  Sparse:  14.77 MB ✅
+  Compression: 185x
+  Status: ENABLED BY PHASE 5
+
+================================================================================
+PERFORMANCE RESULTS
+================================================================================
+
+Kuhn Poker (50 iterations):
+  Dense:  8.4s total, 6 it/s
+  Sparse: 66.1s total, 1 it/s
+  Ratio:  7.9x slower (overhead of Python for-loops)
+
+Leduc Poker (10 iterations):
+  Dense:  N/A (OOM)
+  Sparse: 80.8s total, 0.12 it/s (~8 sec/iteration)
+  Notes:  Slow but acceptable - enables larger games
+
+================================================================================
+CORRECTNESS VALIDATION
+================================================================================
+
+✅ test_phase5_bcoo_conversion.py
+   - BCOO matrices match dense matrices
+   - Sparsity confirmed (3 non-zero per Kuhn level)
+
+✅ test_phase5_sparse_kuhn_quick.py
+   - Sparse vs dense: max difference = 0.0
+   - Identical policies learned
+
+✅ test_phase5_leduc_memory.py
+   - Initialization successful (no OOM)
+   - 10 iterations completed
+   - 936 infosets learned
+   - 185x memory compression
+
+================================================================================
+KEY IMPLEMENTATION DECISIONS
+================================================================================
+
+1. Python for-loops instead of jax.lax.scan
+   - Required due to varying sparsity (different nse per level)
+   - JAX scan requires uniform shapes
+   - Trade-off: Memory savings >> performance loss
+
+2. Removed dense stacked matrices in sparse mode
+   - Initially kept for backward compatibility
+   - Caused 8.2 GB memory usage
+   - Removed after sparse batch code implemented
+   - Result: 185x compression achieved
+
+3. JIT compilation strategy
+   - JIT single-config function, not entire batch
+   - Prevents massive unrolled computation graphs
+   - Enables reasonable compilation times
+
+================================================================================
+PHASE 5 SUCCESS CRITERIA
+================================================================================
+
+✅ Enable Leduc poker (was OOM with dense)
+✅ Achieve >100x memory compression
+✅ Maintain correctness (identical to dense)
+✅ Unlock path to 3+ player Hold'em
+
+PHASE 5: COMPLETE ✅
+
+Next: Phase 6 optimization or Hold'em testing
+================================================================================

@@ -20,13 +20,24 @@ Usage:
     policy = solver.get_average_policy()
 """
 
+# Phase 7.1: Configure JAX memory management BEFORE imports
+# This prevents JAX from pre-allocating 75% of GPU memory (12+ GB on 16 GB GPU)
+# and allows on-demand allocation, fixing OOM on Hold'em games
+import os
+if 'XLA_PYTHON_CLIENT_PREALLOCATE' not in os.environ:
+    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+if 'XLA_PYTHON_CLIENT_ALLOCATOR' not in os.environ:
+    os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+if 'XLA_PYTHON_CLIENT_MEM_FRACTION' not in os.environ:
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.9'
+
 import pyspiel
 import numpy as np
 from typing import Dict, Optional, Tuple, List
 import logging
 import time
 
-# JAX imports
+# JAX imports (AFTER setting environment variables)
 import jax
 import jax.numpy as jnp
 from jax import jit
@@ -80,6 +91,33 @@ def _regret_matching_vectorized_jit(regrets_2d: jnp.ndarray, action_mask: jnp.nd
     )
 
     return strategy
+
+
+# Phase 6.1: JIT-compiled sparse operation helpers
+@jax.jit
+def _sparse_bottom_up_step(L_bcoo, carry_utils, node_strategy):
+    """
+    Phase 6.1 Optimization: JIT-compiled inner step for sparse bottom-up scan.
+
+    Eliminates JAX dispatch overhead by compiling the inner operation.
+    """
+    weighted_L = L_bcoo * node_strategy[jnp.newaxis, :]
+    propagated = weighted_L @ carry_utils
+    level_utils = propagated + carry_utils
+    return level_utils
+
+
+@jax.jit
+def _sparse_reach_step(L_bcoo, carry_reach, strategy):
+    """
+    Phase 6.1 Optimization: JIT-compiled inner step for sparse reach propagation.
+
+    Eliminates JAX dispatch overhead by compiling the inner operation.
+    """
+    propagated = L_bcoo.T @ carry_reach
+    weighted = propagated * strategy
+    next_reach = weighted + carry_reach
+    return next_reach
 
 
 def _batch_build_node_strategies_jit(
@@ -807,31 +845,53 @@ class MatrixCFRSolver:
 
         L_l = self.level_matrices_jax[child_depth]  # Edges TO depth child_depth
 
-        # Phase 5: Convert sparse to dense for indexing operations (initialization only)
+        # Phase 7: Sparse-native child lookup (no .todense() - fixes OOM!)
         if self.use_sparse:
-            L_l = L_l.todense()
+            # BCOO sparse matrix: Extract row indices directly from sparse structure
+            # L_l.indices shape: (num_nonzero, 2) where each row is [row_idx, col_idx]
+            # L_l.data shape: (num_nonzero,) with edge weights (usually 1.0)
 
-        # Find all children of parent_node_id
-        # L_l[parent_node_id, :] gives edges from parent to all possible children
-        parent_row = L_l[parent_node_id, :]
+            # Find all entries in parent_node_id's row
+            row_mask = L_l.indices[:, 0] == parent_node_id
 
-        # Get indices where edge exists (non-zero entries)
-        children_mask = parent_row > 0.5
-        child_indices = jnp.where(children_mask, jnp.arange(len(parent_row)), -1)
-        child_indices = child_indices[child_indices >= 0]  # Filter out -1s
+            # Extract column indices (child node IDs) for this parent
+            # These are already sorted by action order in the original tree traversal
+            child_col_indices = L_l.indices[row_mask, 1]
 
-        # Convert to regular Python list for indexing
-        child_list = [int(idx) for idx in child_indices]
+            # Convert to Python list for indexing
+            child_list = [int(idx) for idx in child_col_indices]
 
-        # The action index corresponds to position in children list
-        # (children are ordered by action in tree traversal)
-        if action < len(child_list):
-            return child_list[action]
+            # The action index corresponds to position in children list
+            if action < len(child_list):
+                return child_list[action]
+            else:
+                raise ValueError(
+                    f"Action {action} out of range for parent {parent_node_id} "
+                    f"with {len(child_list)} children"
+                )
         else:
-            raise ValueError(
-                f"Action {action} out of range for parent {parent_node_id} "
-                f"with {len(child_list)} children"
-            )
+            # Dense path (Kuhn poker and other tiny games)
+            # Find all children of parent_node_id
+            # L_l[parent_node_id, :] gives edges from parent to all possible children
+            parent_row = L_l[parent_node_id, :]
+
+            # Get indices where edge exists (non-zero entries)
+            children_mask = parent_row > 0.5
+            child_indices = jnp.where(children_mask, jnp.arange(len(parent_row)), -1)
+            child_indices = child_indices[child_indices >= 0]  # Filter out -1s
+
+            # Convert to regular Python list for indexing
+            child_list = [int(idx) for idx in child_indices]
+
+            # The action index corresponds to position in children list
+            # (children are ordered by action in tree traversal)
+            if action < len(child_list):
+                return child_list[action]
+            else:
+                raise ValueError(
+                    f"Action {action} out of range for parent {parent_node_id} "
+                    f"with {len(child_list)} children"
+                )
 
     def _build_node_strategy_vector(self) -> jnp.ndarray:
         """
@@ -1784,30 +1844,53 @@ class MatrixCFRSolver:
         """
         Accumulate current strategy weighted by reach probability (Equation 10).
 
-        Phase 4.4 Optimization: Vectorized using 2D arrays instead of Python loop.
+        Phase 6.1 Optimization: Eliminated scatter loop - use vectorized indexing.
 
         Strategy averaging should weight each strategy by the probability of
         reaching that infoset, giving more importance to frequently visited states.
 
         Args:
-            reach_probabilities: Reach probabilities by level from top-down pass
+            reach_probabilities: Reach probabilities by level (each is size num_nodes)
         """
-        # Phase 4.4: Build reach weight vector for all infoset-actions
-        # For each ia_index, we need reach_probabilities[depth][node_id] for its representative node
+        # Phase 6.1: Pre-build reach mapping ONCE and cache
+        # This eliminates the Python for-loop that was causing 22,988 scatter operations
+        if not hasattr(self, '_reach_mapping_cached'):
+            # Build once and cache
+            all_indices = []
+            all_depths = []
+            all_node_ids = []
+
+            for infoset, action_indices in self.infoset_action_indices.items():
+                # Get a representative node for this infoset
+                first_action = self.matrix_repr.infoset_to_actions[infoset][0]
+                if (infoset, first_action) not in self.matrix_repr.action_index_to_node:
+                    continue
+
+                node_id = self.matrix_repr.action_index_to_node[(infoset, first_action)]
+                node = self.matrix_repr.nodes[node_id]
+
+                # Store indices, depth, and node_id for ALL actions at this infoset
+                for idx in action_indices:
+                    all_indices.append(idx)
+                    all_depths.append(node.depth)
+                    all_node_ids.append(node_id)
+
+            self._reach_mapping_cached = (
+                jnp.array(all_indices, dtype=jnp.int32),
+                jnp.array(all_depths, dtype=jnp.int32),
+                jnp.array(all_node_ids, dtype=jnp.int32)
+            )
+
+        indices, depths, node_ids = self._reach_mapping_cached
+
+        # Extract reach weights - vectorized indexing
+        # Stack reach arrays and use advanced indexing
+        reach_stacked = jnp.stack(reach_probabilities, axis=0)  # (num_levels, num_nodes)
+        reach_weights = reach_stacked[depths, node_ids]  # Vectorized 2D indexing
+
+        # Scatter in ONE operation instead of loop
         reach_weights_1d = jnp.zeros(self.matrix_repr.num_infoset_actions, dtype=jnp.float32)
-
-        for infoset, action_indices in self.infoset_action_indices.items():
-            # Get a representative node for this infoset
-            first_action = self.matrix_repr.infoset_to_actions[infoset][0]
-            if (infoset, first_action) not in self.matrix_repr.action_index_to_node:
-                continue
-
-            node_id = self.matrix_repr.action_index_to_node[(infoset, first_action)]
-            node = self.matrix_repr.nodes[node_id]
-            reach_weight = reach_probabilities[node.depth][node_id]
-
-            # Set reach weight for all actions at this infoset
-            reach_weights_1d = reach_weights_1d.at[action_indices].set(reach_weight)
+        reach_weights_1d = reach_weights_1d.at[indices].set(reach_weights)
 
         # Phase 4.4: Vectorized weighted accumulation (no loop!)
         # σ̄ += reach × σ (element-wise for all ia indices)

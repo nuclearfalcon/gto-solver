@@ -1,0 +1,12 @@
+{
+  "num_players": 2,
+  "stack_sizes": [100, 100],
+  "blinds": [25, 50],
+  "betting_abstraction": "fc",
+  "num_rounds": 2,
+  "num_suits": 2,
+  "num_ranks": 4,
+  "num_hole_cards": 2,
+  "num_board_cards": "0 2",
+  "description": "Tiny 2-player Hold'em for Matrix CFR testing: 1bb stacks, fold/call only, 2 suits x 4 ranks, 2 rounds (preflop+flop)"
+}

@@ -1,0 +1,12 @@
+{
+  "num_players": 2,
+  "stack_sizes": [100, 100],
+  "blinds": [25, 50],
+  "betting_abstraction": "fc",
+  "num_rounds": 1,
+  "num_suits": 2,
+  "num_ranks": 3,
+  "num_hole_cards": 2,
+  "num_board_cards": "0",
+  "description": "Ultra-minimal 2-player Hold'em for Matrix CFR: preflop only, 1 round, fold/call only, 2 suits x 3 ranks (6 cards total like Leduc)"
+}

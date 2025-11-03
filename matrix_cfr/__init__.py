@@ -39,6 +39,7 @@ from .subgame_solver import (
     SubgameSolver,
     ChunkedSolver,
     BlueprintPolicy,
+    CombinedPolicy,
 )
 
 __all__ = [
@@ -54,4 +55,5 @@ __all__ = [
     'SubgameSolver',
     'ChunkedSolver',
     'BlueprintPolicy',
+    'CombinedPolicy',
 ]

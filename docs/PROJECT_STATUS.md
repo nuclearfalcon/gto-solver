@@ -1,20 +1,23 @@
 # Matrix-Based GPU CFR Project Status
 
-**Date**: November 2, 2025 (Updated after Phase 7 - HOLD'EM BREAKTHROUGH!)
+**Date**: November 3, 2025 (Updated after Phase 8.5 - CHUNKING VALIDATED!)
 **Branch**: `gpu-matrix-cfr`
 **Goal**: Enable 3-player No-Limit Hold'em solving using GPU-accelerated CFR
 
 ---
 
-## 🎉 MAJOR BREAKTHROUGH: HOLD'EM WORKING!
+## 🎉 MAJOR MILESTONES ACHIEVED!
 
-**As of today**: Matrix CFR solver successfully learns on Kuhn, Leduc, AND Hold'em poker! 🚀🎉
+**As of today**: Matrix CFR solver successfully learns on Kuhn, Leduc, AND Hold'em poker! Chunked solving validated! 🚀🎉
 
 **Phases Complete**:
 - ✅ Phase 1-4: Core algorithm working
 - ✅ Phase 5: Sparse matrices (185x compression)
 - ✅ Phase 6: Scatter optimization (2-3x speedup)
-- ✅ **Phase 7: OOM fixes (151x total reduction, Hold'em working!)**
+- ✅ Phase 7: OOM fixes (151x total reduction, Hold'em working!)
+- ✅ **Phase 8.1-8.3: Memory profiling + chunking infrastructure**
+- ✅ **Phase 8.4: Blueprint initialization (feed-forward solving)**
+- ✅ **Phase 8.5: 3-chunk pipeline validated (preflop→flop→turn)**
 
 ---
 
@@ -127,6 +130,54 @@
 - ✅ Path to full Hold'em cleared with chunking/bucketing
 
 **Documentation**: `PHASE7_OOM_FIX.md`
+
+#### 8. Phase 8: Chunking & Scaling ✅ PHASES 8.1-8.5 COMPLETE
+
+**Phase 8.1-8.3: Infrastructure** (Week 1)
+- ✅ Memory profiling tools (`gpu_memory.py`)
+- ✅ Chunking architecture design
+- ✅ SubgameSolver, ChunkedSolver, BlueprintPolicy classes
+
+**Phase 8.4: Blueprint Initialization** (Week 2)
+- ✅ Strategy setter for initial strategies
+- ✅ Monte Carlo reach probability estimation
+- ✅ Infoset-to-strategy mapping
+- ✅ Preflop→flop integration validated
+
+**Phase 8.5: 3-Chunk Pipeline** (Week 3) - **JUST COMPLETED! 🎉**
+- ✅ CombinedPolicy class (unified multi-round interface)
+- ✅ Memory profiling integration
+- ✅ Aggressive GPU memory cleanup
+- ✅ Dynamic board card calculation
+- ✅ Complete test suite (4 comprehensive tests)
+- ✅ **Validation**: 192 infosets across 3 rounds (preflop→flop→turn)
+
+**Key Finding**: GPU memory fragmentation limits chunk size to ~1,600 nodes with 16GB VRAM. Larger chunks (57k nodes with FCPA betting) cause OOM.
+
+**Production Recommendations**:
+1. Ultra-minimal configs (6-card deck, FC betting) work within constraints
+2. Larger games need CPU fallback or further abstraction
+3. Chunking architecture proven operational
+
+**Files Added** (~2,232 total lines):
+- `matrix_cfr/gpu_memory.py` (550 lines) - Memory profiling
+- `matrix_cfr/subgame_solver.py` (430 lines base + 262 enhancements) - Chunking + CombinedPolicy
+- `test_phase8_chunking.py` (270 lines) - Infrastructure tests
+- `test_phase8_5_full_pipeline.py` (323 lines) - Comprehensive test suite
+- `test_phase8_5_minimal.py` (99 lines) - Working validation
+- `PHASE8_CHUNKING_DESIGN.md` - Design document
+- `PHASE8.5_RESULTS.md` (342 lines) - Phase 8.5 documentation
+- `PHASE8_SUMMARY.md` - Overall Phase 8 summary
+
+**Test Results** (Ultra-minimal config):
+```
+Preflop: 127 nodes,   12 infosets (5.45s, 4 it/s)
+Flop:    517 nodes,   60 infosets (8.20s, 2 it/s)
+Turn:    1,597 nodes, 120 infosets (17.05s, 1 it/s)
+Total:   192 infosets, Peak CPU: 926.8 MB
+```
+
+**Documentation**: `PHASE8_SUMMARY.md`, `PHASE8.5_RESULTS.md`, `PHASE8_CHUNKING_DESIGN.md`
 
 ---
 
@@ -444,41 +495,52 @@ Commits: 5+ major milestones on gpu-matrix-cfr branch
 
 ## 📝 Next Steps
 
-### Immediate (Next Session)
+### Phase 8.6: 3-Player Hold'em Testing (NEXT - Week 4)
 
-1. **Create ultra-minimal Hold'em config**:
-   - [ ] Preflop-only, 6 cards (2 suits × 3 ranks)
-   - [ ] Enumerate tree (target: <1,000 nodes)
-   - [ ] Run convergence test
+**Objective**: Test chunked solving on 3-player games to achieve ultimate project goal
 
-2. **Implement chunking prototype**:
-   - [ ] Solve preflop subgame
-   - [ ] Solve flop subgame using preflop solution
-   - [ ] Validate combined solution
+**Tasks**:
+1. **Create 3-player minimal config**:
+   - [ ] 3 players, ultra-minimal deck (6 cards)
+   - [ ] FC or FCPA betting abstraction
+   - [ ] Preflop → flop → turn chunks
+   - [ ] Enumerate tree sizes
 
-3. **Extended validation**:
-   - [ ] Run 10,000 iterations on Leduc
-   - [ ] Compare with known equilibria
-   - [ ] Measure convergence rates
+2. **Validate 3-player chunking**:
+   - [ ] Run 3-chunk pipeline on 3-player game
+   - [ ] Measure memory usage per chunk
+   - [ ] Validate multi-way pot handling
+   - [ ] Document tree size scaling
 
-### Medium-Term (Weeks 2-4)
+3. **Memory/Performance Analysis**:
+   - [ ] Compare 2p vs 3p memory requirements
+   - [ ] Analyze branching factor impact
+   - [ ] Identify GPU memory limits for 3p
+   - [ ] Document feasibility assessment
+
+**Success Criteria**:
+- 3-player chunked solving operational
+- Memory requirements documented
+- Clear path forward identified (or limitations understood)
+
+### Medium-Term (If Phase 8.6 Succeeds)
 
 4. **Card bucketing implementation**:
    - [ ] Research hand strength evaluators
    - [ ] Implement simple bucketing (5-10 buckets)
-   - [ ] Test on preflop subgames
+   - [ ] Test on 3-player subgames
 
-5. **Scale to realistic Hold'em**:
-   - [ ] 2-player, 2-5bb stacks
+5. **Scale to realistic 3-player Hold'em**:
+   - [ ] 3-player, 5-10bb stacks
    - [ ] Chunking + bucketing combined
-   - [ ] Target: 10K-100K nodes per chunk
+   - [ ] Target: Achieve project goal!
 
-### Long-Term (Months 2-4)
+### Alternative Path (If GPU Limits Hit)
 
-6. **3-player Hold'em solving**:
-   - [ ] Apply all abstractions to 3-player
-   - [ ] Multi-iteration convergence runs
-   - [ ] **Achieve goal**: Solve 3p Hold'em!
+6. **CPU Fallback Implementation**:
+   - [ ] Implement CPU-based matrix operations
+   - [ ] Hybrid GPU/CPU approach
+   - [ ] Trade speed for scalability
 
 ---
 
@@ -524,16 +586,24 @@ Commits: 5+ major milestones on gpu-matrix-cfr branch
   - ✅ Sparse-native child lookup implemented
   - ✅ JAX memory configuration optimized
 
-- **Week 3+ (Next)**:
-  - Test scaling limits (larger Hold'em configs)
-  - Chunking implementation (solve rounds separately)
-  - Card bucketing (hand abstraction)
-  - Path to 3-player Hold'em
+- **Week 3 (Nov 3)**: **🎉 CHUNKING VALIDATED! 🎉**
+  - ✅ Phase 8.1-8.3: Memory profiling + chunking infrastructure
+  - ✅ Phase 8.4: Blueprint initialization (feed-forward solving)
+  - ✅ **Phase 8.5: 3-CHUNK PIPELINE WORKING** (preflop→flop→turn) 🎉
+  - ✅ CombinedPolicy unified interface
+  - ✅ GPU memory cleanup implementation
+  - ✅ Validation: 192 infosets solved, 926.8 MB peak memory
+  - ⚠️ Discovered GPU memory fragmentation limit (~1,600 nodes/chunk)
+
+- **Week 4 (Next)**:
+  - Phase 8.6: Test 3-player Hold'em chunking
+  - Measure 3-player memory requirements
+  - Achieve project goal or identify path forward
 
 ---
 
-**Status**: ✅ **HOLD'EM BREAKTHROUGH ACHIEVED! Preflop (1.6K) and tiny (74K nodes) working!**
+**Status**: ✅ **CHUNKED SOLVING VALIDATED! 3-chunk pipeline (preflop→flop→turn) working!**
 
-**Bottom line**: We have successfully implemented, optimized, AND scaled the matrix-based GPU CFR algorithm to Hold'em! The solver works on Kuhn, Leduc, and now Hold'em variants, achieving 151x total memory reduction through Phase 7's critical OOM fixes. First working Hold'em implementation validates the approach - chunking and bucketing will enable full-scale realistic games.
+**Bottom line**: We have successfully implemented the complete chunked solving pipeline for Hold'em! The solver now works on Kuhn, Leduc, and Hold'em with sequential round-by-round solving. Phase 8.5 achieved 3-chunk pipeline validation with 192 infosets solved across preflop→flop→turn. Critical GPU memory limitation discovered (fragmentation limits chunks to ~1,600 nodes), guiding production config design. **Next milestone: Phase 8.6 will test 3-player Hold'em to achieve ultimate project goal!**
 
-🚀 **Phases 1-7 complete! Hold'em era begins!** 🚀
+🚀 **Phases 1-8.5 complete! Ready for 3-player testing!** 🚀

@@ -94,6 +94,125 @@ class BlueprintPolicy:
             return cls(policy)
 
 
+class CombinedPolicy:
+    """
+    Unified policy interface for querying across all 4 betting round chunks.
+
+    Combines preflop, flop, turn, and river policies into a single queryable interface.
+
+    Usage:
+        # After solving all chunks:
+        combined = CombinedPolicy(policies)  # policies is dict from ChunkedSolver
+        probs = combined.get_action_probs(infoset, round_name="flop")
+
+        # Save/load:
+        combined.save("policies/")
+        loaded = CombinedPolicy.load("policies/")
+    """
+
+    def __init__(self, policies: Dict[str, BlueprintPolicy]):
+        """
+        Initialize combined policy from chunk policies.
+
+        Args:
+            policies: Dict mapping round_name → BlueprintPolicy
+                     (e.g., {"preflop": policy1, "flop": policy2, ...})
+        """
+        self.policies = policies
+        self.rounds = ["preflop", "flop", "turn", "river"]
+
+        # Validate all rounds present
+        for round_name in self.rounds:
+            if round_name not in policies:
+                logger.warning(f"Missing policy for {round_name} round")
+
+        logger.info(f"Initialized CombinedPolicy with {len(policies)} rounds")
+
+    def get_action_probs(
+        self,
+        infoset: str,
+        round_name: str
+    ) -> Optional[Dict[int, float]]:
+        """
+        Get action probabilities for an infoset in a specific round.
+
+        Args:
+            infoset: Information set string
+            round_name: Which round ("preflop", "flop", "turn", "river")
+
+        Returns:
+            Dict mapping action → probability, or None if not found
+        """
+        if round_name not in self.policies:
+            logger.warning(f"No policy for round: {round_name}")
+            return None
+
+        policy = self.policies[round_name]
+        return policy.get_action_probs(infoset)
+
+    def get_total_infosets(self) -> int:
+        """Get total number of infosets across all rounds."""
+        total = 0
+        for policy in self.policies.values():
+            total += len(policy.policy)
+        return total
+
+    def get_infosets_by_round(self) -> Dict[str, int]:
+        """Get number of infosets per round."""
+        return {
+            round_name: len(policy.policy)
+            for round_name, policy in self.policies.items()
+        }
+
+    def save(self, output_dir: str):
+        """
+        Save all policies to directory.
+
+        Args:
+            output_dir: Directory to save policies to
+        """
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+
+        for round_name, policy in self.policies.items():
+            filepath = os.path.join(output_dir, f"{round_name}_policy.json")
+            policy.save(filepath)
+            logger.info(f"Saved {round_name} policy to {filepath}")
+
+    @classmethod
+    def load(cls, output_dir: str) -> 'CombinedPolicy':
+        """
+        Load all policies from directory.
+
+        Args:
+            output_dir: Directory containing policy files
+
+        Returns:
+            CombinedPolicy instance with loaded policies
+        """
+        import os
+
+        policies = {}
+        rounds = ["preflop", "flop", "turn", "river"]
+
+        for round_name in rounds:
+            filepath = os.path.join(output_dir, f"{round_name}_policy.json")
+            if os.path.exists(filepath):
+                policies[round_name] = BlueprintPolicy.load(filepath)
+                logger.info(f"Loaded {round_name} policy from {filepath}")
+            else:
+                logger.warning(f"Policy file not found: {filepath}")
+
+        return cls(policies)
+
+    def __repr__(self) -> str:
+        """String representation showing round coverage."""
+        infosets = self.get_infosets_by_round()
+        total = self.get_total_infosets()
+        rounds_str = ", ".join(f"{r}:{n}" for r, n in infosets.items())
+        return f"CombinedPolicy({rounds_str}, total={total})"
+
+
 class SubgameSolver:
     """
     Solves a single betting round chunk of Hold'em.
@@ -144,11 +263,7 @@ class SubgameSolver:
 
         Strategy:
         - Set num_rounds=1 (only this round's betting)
-        - Set num_board_cards appropriately:
-            - Preflop: "0" (no board yet)
-            - Flop: "3" (flop cards)
-            - Turn: "4" (flop + turn)
-            - River: "5" (all board cards)
+        - Set num_board_cards based on cumulative cards dealt up to this round
         - Keep other params (num_players, stacks, blinds, etc.)
         """
         config = self.full_config.copy()
@@ -156,14 +271,18 @@ class SubgameSolver:
         # Override for single round (OpenSpiel uses camelCase)
         config["numRounds"] = 1
 
-        # Set board cards based on round
-        board_cards_map = {
-            "preflop": "0",
-            "flop": "3",
-            "turn": "4",
-            "river": "5"
-        }
-        config["numBoardCards"] = board_cards_map[self.round]
+        # Calculate cumulative board cards up to this round
+        # Parse original board card string (e.g., "0 1 1 1")
+        original_board_cards = config.get("numBoardCards", "0 3 1 1")
+        board_per_round = [int(x) for x in original_board_cards.split()]
+
+        # Map round name to index
+        round_indices = {"preflop": 0, "flop": 1, "turn": 2, "river": 3}
+        round_idx = round_indices[self.round]
+
+        # Cumulative cards up to and including this round
+        cumulative_cards = sum(board_per_round[:round_idx + 1])
+        config["numBoardCards"] = str(cumulative_cards)
 
         # Adjust first player (who acts first this round)
         # For preflop: SB acts first (player 0 if 2p)
@@ -213,6 +332,15 @@ class SubgameSolver:
         policy_dict = solver.get_strategy_dict()
 
         logger.info(f"  {self.round} chunk solved: {len(policy_dict)} infosets")
+
+        # CRITICAL: Delete solver to free GPU memory before returning
+        # This prevents GPU memory fragmentation between chunks
+        del solver
+        del game
+
+        # Force garbage collection to free GPU arrays immediately
+        import gc
+        gc.collect()
 
         # Return as blueprint for next round
         return BlueprintPolicy(policy_dict)
@@ -402,18 +530,27 @@ class ChunkedSolver:
     Usage:
         chunked = ChunkedSolver(holdem_config)
         combined_policy = chunked.solve(iterations_per_chunk=10000)
+
+        # With memory profiling:
+        from matrix_cfr.gpu_memory import MemoryProfiler
+        profiler = MemoryProfiler()
+        chunked = ChunkedSolver(holdem_config, memory_profiler=profiler)
+        combined_policy = chunked.solve(iterations_per_chunk=10000)
+        profiler.print_report()
     """
 
-    def __init__(self, full_game_config: Dict[str, Any]):
+    def __init__(self, full_game_config: Dict[str, Any], memory_profiler=None):
         """
         Initialize chunked solver for full Hold'em game.
 
         Args:
             full_game_config: Complete Hold'em configuration (all rounds)
+            memory_profiler: Optional MemoryProfiler for tracking memory usage
         """
         self.config = full_game_config
         self.chunks = ["preflop", "flop", "turn", "river"]
         self.policies = {}  # Store policy for each chunk
+        self.profiler = memory_profiler  # Optional memory profiler
 
         logger.info(f"Initialized ChunkedSolver for {self.config.get('num_players', 2)}-player Hold'em")
 
@@ -438,12 +575,20 @@ class ChunkedSolver:
         logger.info("CHUNKED HOLD'EM SOLVING")
         logger.info("=" * 80)
 
+        # Take baseline memory snapshot if profiler provided
+        if self.profiler:
+            self.profiler.snapshot("baseline")
+
         blueprint = None
 
         for chunk_name in self.chunks:
             logger.info(f"\n{'='*80}")
             logger.info(f"CHUNK: {chunk_name.upper()}")
             logger.info(f"{'='*80}")
+
+            # Memory snapshot before chunk
+            if self.profiler:
+                self.profiler.snapshot(f"before_{chunk_name}")
 
             # Create subgame solver
             subgame = SubgameSolver(
@@ -464,11 +609,60 @@ class ChunkedSolver:
             # Feed forward as blueprint for next chunk
             blueprint = policy
 
+            # CRITICAL: Explicitly delete solver to free GPU memory
+            # The solver holds JAX arrays that fragment GPU memory
+            del subgame
+
+            # Memory snapshot after chunk
+            if self.profiler:
+                self.profiler.snapshot(f"after_{chunk_name}")
+
             logger.info(f"✓ {chunk_name} chunk complete\n")
+
+            # CRITICAL: Aggressive GPU memory cleanup between chunks
+            # JAX accumulates memory across chunks, leading to fragmentation and OOM
+            import gc
+            import jax
+            from jax.lib import xla_bridge
+
+            logger.info("  Cleaning up GPU memory...")
+
+            # Step 1: Clear JAX compilation caches
+            try:
+                jax.clear_caches()
+            except:
+                pass
+
+            # Step 2: Force Python garbage collection
+            gc.collect()
+
+            # Step 3: Get backend and force memory release
+            try:
+                # Get the default backend (GPU if available)
+                backend = xla_bridge.get_backend()
+
+                # Force defragmentation by clearing live buffers
+                # This is the key to preventing OOM from fragmentation
+                if hasattr(backend, 'defragment'):
+                    backend.defragment()
+                    logger.info("  ✓ Defragmented GPU memory")
+
+                logger.info("  ✓ Cleared JAX caches and triggered GPU cleanup")
+            except Exception as e:
+                logger.warning(f"  ⚠️ Could not defragment: {e}")
+
+            # Step 4: Final aggressive garbage collection
+            gc.collect()
+            gc.collect()  # Twice for good measure
 
         logger.info("=" * 80)
         logger.info("ALL CHUNKS SOLVED")
         logger.info("=" * 80)
+
+        # Print memory report if profiler was provided
+        if self.profiler:
+            logger.info("")  # Blank line
+            self.profiler.print_report()
 
         return self.policies
 

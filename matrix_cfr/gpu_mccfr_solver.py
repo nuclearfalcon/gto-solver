@@ -268,7 +268,9 @@ class GPUMCCFRSolver:
         key: jax.random.PRNGKey,
         num_players: int,
         policy_fn: Callable[[str, jnp.ndarray], jnp.ndarray],
-        max_actions: int = 100
+        max_actions: int = 100,
+        stacks: Optional[jnp.ndarray] = None,
+        blinds: Optional[jnp.ndarray] = None
     ) -> Tuple[list, list, list, jnp.ndarray]:
         """
         Sample one complete game trajectory using given policy.
@@ -280,13 +282,26 @@ class GPUMCCFRSolver:
             num_players: Number of players
             policy_fn: Policy function
             max_actions: Maximum actions per trajectory
+            stacks: Starting stacks (optional, for Hold'em)
+            blinds: Blind amounts (optional, for Hold'em)
 
         Returns:
             Tuple of (states, actions, players, terminal_payoffs)
         """
         # Deal initial state
         key, subkey = random.split(key)
-        state = self.game_engine.deal_initial_state(subkey)
+
+        # Try to call with different signatures based on game engine
+        try:
+            # Hold'em-style (requires stacks and blinds)
+            if stacks is not None and blinds is not None:
+                state = self.game_engine.deal_initial_state(subkey, num_players, stacks, blinds)
+            else:
+                # Kuhn-style (just key)
+                state = self.game_engine.deal_initial_state(subkey)
+        except TypeError:
+            # Fallback: try just key
+            state = self.game_engine.deal_initial_state(subkey)
 
         states_list = []
         actions_list = []
@@ -430,7 +445,9 @@ class GPUMCCFRSolver:
             subkey,
             num_players,
             policy_fn,
-            max_actions=100
+            max_actions=100,
+            stacks=stacks,
+            blinds=blinds
         )
 
         # Compute counterfactual values and regrets

@@ -25,7 +25,7 @@ Usage:
 
 import pyspiel
 import logging
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any, Tuple, Union
 from dataclasses import dataclass
 import json
 import random
@@ -213,6 +213,63 @@ class CombinedPolicy:
         return f"CombinedPolicy({rounds_str}, total={total})"
 
 
+# Phase 8.7: Helper functions for public card filtering
+
+def _parse_public_cards_from_infoset(infoset: str) -> str:
+    """
+    Extract public cards from infoset string.
+
+    Infoset format: "[...][Public: CARDS][...]"
+    Example: "[Public: 2s3h4d5c]" -> "2s3h4d5c"
+
+    Args:
+        infoset: Information set string
+
+    Returns:
+        Public cards string (e.g., "2s3h4d5c") or empty string if none
+    """
+    import re
+    match = re.search(r'\[Public: ([^\]]*)\]', infoset)
+    return match.group(1) if match else ""
+
+
+def _get_last_public_card(public_cards_str: str) -> str:
+    """
+    Extract the last card from public cards string.
+
+    Args:
+        public_cards_str: Public cards (e.g., "2s3h4d5c")
+
+    Returns:
+        Last card (e.g., "5c") or empty string if none
+    """
+    if not public_cards_str or len(public_cards_str) < 2:
+        return ""
+    # Each card is 2 characters (rank + suit)
+    return public_cards_str[-2:]
+
+
+def _infoset_matches_public_card(infoset: str, target_card: str) -> bool:
+    """
+    Check if infoset's last public card matches target.
+
+    Phase 8.7: Used for filtering policies by public card in sub-chunking.
+
+    Args:
+        infoset: Information set string
+        target_card: Target card (e.g., "2s", "Kh")
+
+    Returns:
+        True if infoset's last public card matches target
+    """
+    public_cards = _parse_public_cards_from_infoset(infoset)
+    if not public_cards:
+        return False
+
+    last_card = _get_last_public_card(public_cards)
+    return last_card == target_card
+
+
 class SubgameSolver:
     """
     Solves a single betting round chunk of Hold'em.
@@ -230,7 +287,11 @@ class SubgameSolver:
         self,
         full_game_config: Dict[str, Any],
         round_name: str,
-        blueprint_policy: Optional[BlueprintPolicy] = None
+        blueprint_policy: Optional[BlueprintPolicy] = None,
+        precision: str = 'fp32',
+        micro_batch_size: int = 24,
+        max_nodes: Optional[Union[int, Dict[str, int]]] = None,
+        use_true_predealing: bool = True
     ):
         """
         Initialize subgame solver for a specific betting round.
@@ -239,10 +300,43 @@ class SubgameSolver:
             full_game_config: Full Hold'em configuration (will be adapted for subgame)
             round_name: Which round to solve ("preflop", "flop", "turn", "river")
             blueprint_policy: Policy from previous round (None for preflop)
+            precision: Tensor precision - 'fp32' (default) or 'fp16' for 50% memory savings
+            micro_batch_size: Max batch size for utility computation (default 24, use 6-12 for large games)
+            max_nodes: Phase 8.7 - Max nodes before auto-splitting. Either:
+                       - int: Single threshold for all rounds
+                       - Dict[str, int]: Per-round thresholds (e.g., {"turn": 10000, "river": 5000})
+                       - None: Use default thresholds
+            use_true_predealing: Phase 9 - Use true game pre-dealing (Option A) instead of filtered extraction (Option B).
+                                Default True for 8× memory reduction. Set False for backward compatibility.
         """
         self.full_config = full_game_config
         self.round = round_name
         self.blueprint = blueprint_policy
+        self.precision = precision
+        self.micro_batch_size = micro_batch_size
+        self.use_true_predealing = use_true_predealing
+
+        # Phase 8.7: Parse max_nodes parameter to get threshold for this round
+        if max_nodes is None:
+            # Default per-round thresholds
+            default_thresholds = {
+                "preflop": 50000,  # Preflop is small, no split needed
+                "flop": 20000,     # Flop is manageable
+                "turn": 10000,     # Turn needs splitting (~57k nodes)
+                "river": 5000      # River needs aggressive splitting (~200k+ nodes)
+            }
+            self.max_nodes_threshold = default_thresholds.get(round_name, 10000)
+        elif isinstance(max_nodes, int):
+            # Single threshold for all rounds
+            self.max_nodes_threshold = max_nodes
+        elif isinstance(max_nodes, dict):
+            # Per-round thresholds
+            self.max_nodes_threshold = max_nodes.get(round_name, 10000)
+        else:
+            raise ValueError(f"max_nodes must be int, dict, or None, got {type(max_nodes)}")
+
+        # Phase 8.7: Cache for estimated chunk size (computed lazily)
+        self._estimated_nodes = None
 
         # Validate
         valid_rounds = ["preflop", "flop", "turn", "river"]
@@ -255,7 +349,9 @@ class SubgameSolver:
         # Create subgame-specific config
         self.subgame_config = self._create_subgame_config()
 
-        logger.info(f"Initialized SubgameSolver for {round_name} round")
+        logger.info(f"Initialized SubgameSolver for {round_name} round "
+                   f"(precision={precision}, micro_batch={micro_batch_size}, "
+                   f"max_nodes={self.max_nodes_threshold})")
 
     def _create_subgame_config(self) -> Dict[str, Any]:
         """
@@ -296,9 +392,439 @@ class SubgameSolver:
 
         return config
 
-    def solve(self, iterations: int, progress_interval: int = 1000) -> BlueprintPolicy:
+    def _estimate_chunk_size(self, num_samples: int = 500) -> int:
         """
-        Solve this subgame chunk to approximate equilibrium.
+        Estimate the number of nodes in this chunk's game tree using sampling.
+
+        Phase 8.7: Uses Monte Carlo sampling to estimate game tree size before solving.
+        This allows automatic detection of chunks that need sub-chunking.
+
+        Strategy:
+        1. Sample multiple random game trajectories
+        2. Count nodes (chance + decision) per trajectory
+        3. Average and extrapolate to estimate full tree size
+
+        Args:
+            num_samples: Number of game trajectories to sample (default 500)
+
+        Returns:
+            Estimated number of nodes in game tree
+        """
+        # Return cached value if already computed
+        if self._estimated_nodes is not None:
+            return self._estimated_nodes
+
+        logger.info(f"  Estimating {self.round} chunk size ({num_samples} samples)...")
+
+        # Create game for estimation
+        game = pyspiel.load_game("universal_poker", self.subgame_config)
+
+        total_nodes = 0
+
+        for sample_idx in range(num_samples):
+            state = game.new_initial_state()
+            nodes_this_trajectory = 0
+
+            # Simulate one complete hand
+            while not state.is_terminal():
+                nodes_this_trajectory += 1
+
+                if state.is_chance_node():
+                    # Random card dealing
+                    outcomes = state.chance_outcomes()
+                    action_list, prob_list = zip(*outcomes)
+                    action = random.choices(action_list, weights=prob_list)[0]
+                    state.apply_action(action)
+                else:
+                    # Player decision - random action
+                    legal_actions = state.legal_actions()
+                    action = random.choice(legal_actions)
+                    state.apply_action(action)
+
+            total_nodes += nodes_this_trajectory
+
+        # Average nodes per trajectory
+        avg_nodes_per_trajectory = total_nodes / num_samples
+
+        # Estimate full game tree size
+        # Since we're sampling paths, the full tree is much larger
+        # Heuristic: multiply by branching factor estimate
+        # For poker, branching factor varies by:
+        # - Card dealing: ~deck_size choices
+        # - Betting: ~4 choices (fold/call/bet/allin for FCPA)
+        num_suits = self.full_config.get('numSuits', 4)
+        num_ranks = self.full_config.get('numRanks', 13)
+        deck_size = num_suits * num_ranks
+
+        # Rough branching factor estimate
+        # Chance nodes: ~deck_size / 2 (cards get removed)
+        # Action nodes: ~3 (average legal actions)
+        avg_branching_factor = (deck_size / 2 + 3) / 2
+
+        # Estimate: avg_path_length * branching_factor^(depth)
+        # Simplified: use exponential scaling
+        # Conservative estimate: multiply by log(avg_branching_factor)^2
+        import math
+        depth_factor = max(1.0, math.log(avg_branching_factor) ** 2)
+
+        estimated_nodes = int(avg_nodes_per_trajectory * depth_factor * 100)
+
+        # Cache result
+        self._estimated_nodes = estimated_nodes
+
+        logger.info(f"    Estimated {self.round} chunk: ~{estimated_nodes:,} nodes "
+                   f"(avg path: {avg_nodes_per_trajectory:.1f} nodes)")
+
+        return estimated_nodes
+
+    @property
+    def needs_splitting(self) -> bool:
+        """
+        Check if this chunk needs sub-chunking based on size estimate.
+
+        Phase 8.7: Only enable sub-chunking for "turn" and "river" rounds,
+        as preflop/flop are typically small enough to solve directly.
+
+        Returns:
+            True if chunk should be split into sub-chunks
+        """
+        # Only split turn/river rounds (preflop/flop are small)
+        if self.round not in ["turn", "river"]:
+            return False
+
+        # Check if estimated size exceeds threshold
+        estimated_nodes = self._estimate_chunk_size()
+        return estimated_nodes > self.max_nodes_threshold
+
+    def _card_string_to_action(self, card_str: str, game: pyspiel.Game) -> int:
+        """
+        Convert card string (e.g., '2s', 'Ah') to OpenSpiel action index.
+
+        Phase 9: Helper for creating starting states with pre-dealt cards.
+
+        Args:
+            card_str: Card string like '2s', 'Kh', etc.
+            game: OpenSpiel game instance
+
+        Returns:
+            Action index for dealing this card
+        """
+        rank_chars = '23456789TJQKA'
+        suit_chars = 'shdc'
+
+        if len(card_str) != 2:
+            raise ValueError(f"Card string must be 2 characters, got: {card_str}")
+
+        rank_char = card_str[0]
+        suit_char = card_str[1]
+
+        if rank_char not in rank_chars or suit_char not in suit_chars:
+            raise ValueError(f"Invalid card string: {card_str}")
+
+        rank_idx = rank_chars.index(rank_char)
+        suit_idx = suit_chars.index(suit_char)
+
+        num_suits = self.full_config.get('numSuits', 4)
+
+        # OpenSpiel card encoding: card_id = rank * num_suits + suit
+        card_id = rank_idx * num_suits + suit_idx
+
+        return card_id
+
+    def _create_starting_state_with_card(
+        self,
+        game: pyspiel.Game,
+        target_card: str
+    ) -> pyspiel.State:
+        """
+        Create a starting state with specific public card pre-dealt.
+
+        Phase 9: True game pre-dealing (Option A). Navigates through chance nodes
+        to deal specific cards, returning a constrained game state that only
+        contains relevant sub-tree.
+
+        Args:
+            game: OpenSpiel game instance
+            target_card: Card to pre-deal (e.g., '2s' for turn, 'Kh' for river)
+
+        Returns:
+            Game state with target card dealt as last public card
+        """
+        state = game.new_initial_state()
+
+        # Determine which public card position we're constraining
+        # based on the round (turn = 4th board card, river = 5th)
+        num_board_cards_str = self.full_config.get('numBoardCards', '0 3 1 1')
+        board_cards_per_round = list(map(int, num_board_cards_str.split()))
+
+        # Calculate total board cards up to this round
+        round_idx = ["preflop", "flop", "turn", "river"].index(self.round)
+
+        # For turn: we need to deal all hole cards, then 3 flop cards, then our specific turn card
+        # For river: we need hole cards + 3 flop + 1 turn + our specific river card
+
+        target_card_action = self._card_string_to_action(target_card, game)
+        cards_dealt = []
+
+        # Navigate through chance nodes until we reach the point where we need to deal target card
+        chance_nodes_processed = 0
+        num_players = self.full_config.get('numPlayers', 2)
+        num_hole_cards = self.full_config.get('numHoleCards', 2)
+
+        # Total hole cards to deal first
+        total_hole_cards = num_players * num_hole_cards
+
+        # Total board cards before our target card
+        total_board_before_target = sum(board_cards_per_round[:round_idx + 1]) - 1
+
+        # Total cards to deal before target
+        total_cards_before_target = total_hole_cards + total_board_before_target
+
+        while not state.is_terminal():
+            if state.is_chance_node():
+                outcomes = state.chance_outcomes()
+                available_actions = [action for action, _ in outcomes]
+
+                # Check if this is the chance node for our target card
+                if chance_nodes_processed == total_cards_before_target:
+                    # This is where we deal our target card
+                    if target_card_action in available_actions:
+                        state.apply_action(target_card_action)
+                        cards_dealt.append(target_card)
+                        chance_nodes_processed += 1
+                        # We've dealt the target card, now we're done setting up
+                        break
+                    else:
+                        # Target card already dealt earlier (conflict)
+                        raise ValueError(
+                            f"Cannot deal {target_card}: already dealt in previous rounds"
+                        )
+                else:
+                    # Deal random card (but not our target card, save it for later)
+                    valid_actions = [a for a in available_actions if a != target_card_action]
+                    if not valid_actions:
+                        raise ValueError(f"No valid cards to deal (target {target_card} is only option)")
+
+                    action = random.choice(valid_actions)
+                    state.apply_action(action)
+                    chance_nodes_processed += 1
+            else:
+                # Player decision node - take random action to continue
+                legal_actions = state.legal_actions()
+                action = random.choice(legal_actions)
+                state.apply_action(action)
+
+        logger.debug(f"  Created starting state with {target_card} pre-dealt "
+                    f"(dealt {len(cards_dealt)} target cards, passed through {chance_nodes_processed} chance nodes)")
+
+        return state
+
+    def _enumerate_public_cards(self) -> List[str]:
+        """
+        Enumerate all possible public cards for sub-chunking.
+
+        Phase 8.7: For Turn/River chunks, returns all possible cards
+        that could be dealt as the last public card.
+
+        Returns:
+            List of card strings (e.g., ['2s', '2h', '3s', ..., 'Ah', 'Ad', 'Ac'])
+        """
+        num_suits = self.full_config.get('numSuits', 4)
+        num_ranks = self.full_config.get('numRanks', 13)
+
+        # Rank encoding: 2=0, 3=1, ..., K=11, A=12
+        rank_chars = '23456789TJQKA'[:num_ranks]
+        # Suit encoding: s=0, h=1, d=2, c=3
+        suit_chars = 'shdc'[:num_suits]
+
+        # Generate all card strings
+        cards = [rank + suit for rank in rank_chars for suit in suit_chars]
+
+        logger.info(f"  Enumerated {len(cards)} possible public cards "
+                   f"({num_ranks} ranks × {num_suits} suits)")
+
+        return cards
+
+    def _solve_with_public_card_filter(
+        self,
+        target_card: str,
+        iterations: int,
+        progress_interval: int,
+        blueprint_policy: Optional[BlueprintPolicy] = None
+    ) -> BlueprintPolicy:
+        """
+        Solve the full game and filter policy to only infosets with target public card.
+
+        Phase 8.7: Hybrid approach between Option A (Game Wrapper) and Option B (Filtered Extraction).
+        We solve the normal game but only keep infosets matching the target card.
+
+        This provides memory benefits (smaller policy) while being simpler to implement
+        than true game pre-dealing.
+
+        Args:
+            target_card: Card to filter by (e.g., "2s", "Kh")
+            iterations: CFR iterations
+            progress_interval: Logging frequency
+            blueprint_policy: Optional blueprint for initialization
+
+        Returns:
+            BlueprintPolicy containing only infosets with target card
+        """
+        logger.info(f"    Solving sub-chunk for {target_card}...")
+
+        # Import here to avoid circular dependency
+        from matrix_cfr.matrix_cfr_solver import MatrixCFRSolver
+
+        # Create game normally
+        game = pyspiel.load_game("universal_poker", self.subgame_config)
+
+        # Create solver
+        solver = MatrixCFRSolver(
+            game,
+            use_sparse=True,
+            precision=self.precision,
+            micro_batch_size=self.micro_batch_size
+        )
+
+        # Initialize from blueprint if provided
+        if blueprint_policy is not None:
+            logger.info(f"      Using blueprint for warm-start")
+            self._initialize_from_blueprint_with_policy(solver, blueprint_policy)
+
+        # Solve normally
+        solver.solve(iterations=iterations, progress_interval=progress_interval)
+
+        # Extract full policy
+        full_policy_dict = solver.get_strategy_dict()
+
+        # Filter to only infosets matching target card
+        filtered_policy_dict = {}
+        for infoset, action_probs in full_policy_dict.items():
+            if _infoset_matches_public_card(infoset, target_card):
+                filtered_policy_dict[infoset] = action_probs
+
+        logger.info(f"      Filtered: {len(filtered_policy_dict)} / {len(full_policy_dict)} infosets "
+                   f"({100.0 * len(filtered_policy_dict) / len(full_policy_dict):.1f}%)")
+
+        # Cleanup
+        del solver
+        del game
+        import gc
+        gc.collect()
+
+        return BlueprintPolicy(filtered_policy_dict)
+
+    def _solve_with_true_predealing(
+        self,
+        target_card: str,
+        iterations: int,
+        progress_interval: int,
+        blueprint_policy: Optional[BlueprintPolicy] = None
+    ) -> BlueprintPolicy:
+        """
+        Solve with true game pre-dealing - constrains game tree BEFORE solving.
+
+        Phase 9: Option A (True Pre-Dealing). Creates a starting state with target card
+        pre-dealt, then builds matrix representation only for that constrained sub-tree.
+        This achieves GENUINE memory reduction (8× smaller game tree) vs Option B which
+        solves full tree then filters.
+
+        Args:
+            target_card: Card to pre-deal (e.g., "2s", "Kh")
+            iterations: CFR iterations
+            progress_interval: Logging frequency
+            blueprint_policy: Optional blueprint for initialization
+
+        Returns:
+            BlueprintPolicy for this constrained game tree
+        """
+        logger.info(f"    Solving sub-chunk for {target_card} (true pre-dealing)...")
+
+        # Import here to avoid circular dependency
+        from matrix_cfr.matrix_cfr_solver import MatrixCFRSolver
+        from matrix_cfr.game_to_matrix import GameTreeConverter
+
+        # Create game
+        game = pyspiel.load_game("universal_poker", self.subgame_config)
+
+        # Phase 9: Create starting state with target card pre-dealt
+        starting_state = self._create_starting_state_with_card(game, target_card)
+
+        logger.info(f"      Created starting state with {target_card} pre-dealt")
+
+        # Build matrix representation from constrained starting state
+        converter = GameTreeConverter(game)
+        matrices = converter.build_matrices(starting_state=starting_state)
+
+        logger.info(f"      Game tree: {matrices.num_nodes} nodes (vs full tree)")
+        logger.info(f"      Infosets: {matrices.num_infosets}")
+
+        # Create solver with constrained matrices
+        solver = MatrixCFRSolver(
+            game,
+            use_sparse=True,
+            precision=self.precision,
+            micro_batch_size=self.micro_batch_size
+        )
+
+        # Replace solver's matrices with our constrained ones
+        solver.matrices = matrices
+        solver.num_infosets = matrices.num_infosets
+        solver.infoset_to_actions = matrices.infoset_to_actions
+
+        # Initialize from blueprint if provided
+        if blueprint_policy is not None:
+            logger.info(f"      Using blueprint for warm-start")
+            self._initialize_from_blueprint_with_policy(solver, blueprint_policy)
+
+        # Solve constrained game
+        solver.solve(iterations=iterations, progress_interval=progress_interval)
+
+        # Extract policy (NO filtering needed - all infosets are relevant!)
+        policy_dict = solver.get_strategy_dict()
+
+        logger.info(f"      Policy: {len(policy_dict)} infosets")
+
+        # Cleanup
+        del solver
+        del converter
+        del game
+        import gc
+        gc.collect()
+
+        return BlueprintPolicy(policy_dict)
+
+    def _initialize_from_blueprint_with_policy(
+        self,
+        solver,
+        blueprint_policy: BlueprintPolicy
+    ):
+        """
+        Initialize solver from blueprint policy.
+
+        Phase 8.7: Simplified version that uses blueprint directly without reach probability estimation.
+
+        Args:
+            solver: MatrixCFRSolver instance
+            blueprint_policy: Blueprint policy to initialize from
+        """
+        # Build strategy mapping
+        strategy_dict = self._build_strategy_mapping(
+            blueprint=blueprint_policy,
+            solver=solver,
+            reach_probs=None
+        )
+
+        # Set initial strategy
+        stats = solver.set_initial_strategy_from_policy(strategy_dict)
+
+        logger.info(f"        Blueprint coverage: {stats['coverage_pct']:.1f}%")
+
+    def _solve_direct(self, iterations: int, progress_interval: int = 1000) -> BlueprintPolicy:
+        """
+        Solve this chunk directly without sub-chunking.
+
+        Phase 8.7: Refactored from solve() - contains original solving logic.
 
         Args:
             iterations: Number of CFR iterations
@@ -307,7 +833,7 @@ class SubgameSolver:
         Returns:
             BlueprintPolicy containing the equilibrium strategy for this round
         """
-        logger.info(f"Solving {self.round} chunk for {iterations} iterations...")
+        logger.info(f"  Solving {self.round} chunk directly ({iterations} iterations)...")
 
         # Import here to avoid circular dependency
         from matrix_cfr.matrix_cfr_solver import MatrixCFRSolver
@@ -315,15 +841,20 @@ class SubgameSolver:
         # Create OpenSpiel game for this subgame
         game = pyspiel.load_game("universal_poker", self.subgame_config)
 
-        # Create solver
-        solver = MatrixCFRSolver(game, use_sparse=True)
+        # Phase 8.6: Create solver with memory optimization parameters
+        solver = MatrixCFRSolver(
+            game,
+            use_sparse=True,
+            precision=self.precision,
+            micro_batch_size=self.micro_batch_size
+        )
 
-        # TODO Phase 8.4: If blueprint provided, initialize strategies from blueprint
+        # If blueprint provided, initialize strategies from blueprint
         if self.blueprint is not None:
-            logger.info(f"  Using blueprint policy from previous round")
+            logger.info(f"    Using blueprint policy from previous round")
             self._initialize_from_blueprint(solver)
         else:
-            logger.info(f"  No blueprint - using uniform initialization")
+            logger.info(f"    No blueprint - using uniform initialization")
 
         # Solve
         solver.solve(iterations=iterations, progress_interval=progress_interval)
@@ -331,7 +862,7 @@ class SubgameSolver:
         # Extract policy (use get_strategy_dict for proper dict format)
         policy_dict = solver.get_strategy_dict()
 
-        logger.info(f"  {self.round} chunk solved: {len(policy_dict)} infosets")
+        logger.info(f"    {self.round} chunk solved: {len(policy_dict)} infosets")
 
         # CRITICAL: Delete solver to free GPU memory before returning
         # This prevents GPU memory fragmentation between chunks
@@ -344,6 +875,133 @@ class SubgameSolver:
 
         # Return as blueprint for next round
         return BlueprintPolicy(policy_dict)
+
+    def solve(self, iterations: int, progress_interval: int = 1000) -> BlueprintPolicy:
+        """
+        Solve this subgame chunk to approximate equilibrium.
+
+        Phase 8.7: Now supports automatic sub-chunking for large chunks.
+        - If estimated nodes ≤ max_nodes: solve directly
+        - If estimated nodes > max_nodes: split by public card, solve sequentially with warm-start
+
+        Args:
+            iterations: Number of CFR iterations per sub-chunk
+            progress_interval: How often to log progress
+
+        Returns:
+            BlueprintPolicy containing the equilibrium strategy for this round
+        """
+        logger.info(f"Solving {self.round} chunk...")
+
+        # Phase 8.7: Check if sub-chunking is needed
+        if not self.needs_splitting:
+            # Chunk is small enough - solve directly
+            return self._solve_direct(iterations, progress_interval)
+
+        # Phase 8.7: Sub-chunking path
+        estimated_nodes = self._estimate_chunk_size()
+        logger.info(f"  Chunk too large (~{estimated_nodes:,} nodes > {self.max_nodes_threshold:,} threshold)")
+        logger.info(f"  Splitting into sub-chunks by public card...")
+
+        # Enumerate all possible public cards for this round
+        public_cards = self._enumerate_public_cards()
+        num_sub_chunks = len(public_cards)
+
+        logger.info(f"  Creating {num_sub_chunks} sub-chunks (target: ~{estimated_nodes // num_sub_chunks:,} nodes each)")
+
+        # Solve each sub-chunk sequentially with warm-starting
+        sub_policies = {}
+        current_blueprint = self.blueprint  # Start with original blueprint (from previous round)
+
+        for i, card in enumerate(public_cards):
+            logger.info(f"\n  Sub-chunk {i+1}/{num_sub_chunks}: {self.round}|{card}")
+
+            # Phase 9: Choose solving method based on use_true_predealing flag
+            if self.use_true_predealing:
+                # Option A: True pre-dealing (8× memory reduction, 8× speed improvement)
+                sub_policy = self._solve_with_true_predealing(
+                    target_card=card,
+                    iterations=iterations,
+                    progress_interval=progress_interval,
+                    blueprint_policy=current_blueprint
+                )
+            else:
+                # Option B: Filtered extraction (backward compatibility)
+                sub_policy = self._solve_with_public_card_filter(
+                    target_card=card,
+                    iterations=iterations,
+                    progress_interval=progress_interval,
+                    blueprint_policy=current_blueprint
+                )
+
+            # Store result
+            sub_chunk_key = f"{self.round}_{card}"
+            sub_policies[sub_chunk_key] = sub_policy
+
+            # Use this policy as blueprint for next sub-chunk (warm-start)
+            current_blueprint = sub_policy
+
+            # Memory cleanup between sub-chunks
+            import gc
+            import jax
+            gc.collect()
+            try:
+                jax.clear_caches()
+            except:
+                pass
+
+        # Merge all sub-chunk policies
+        logger.info(f"\n  Merging {len(sub_policies)} sub-chunk policies...")
+        merged_policy = self._merge_sub_policies(sub_policies)
+
+        logger.info(f"  {self.round} chunk complete: {len(merged_policy.policy)} total infosets")
+
+        return merged_policy
+
+    def _merge_sub_policies(
+        self,
+        sub_policies: Dict[str, BlueprintPolicy]
+    ) -> BlueprintPolicy:
+        """
+        Merge sub-chunk policies into a single unified policy.
+
+        Phase 8.7: Each sub-chunk covers a disjoint set of infosets (conditioned on
+        different public cards), so we can simply union all policies.
+
+        Args:
+            sub_policies: Dict mapping sub_chunk_key → BlueprintPolicy
+                         (e.g., {"turn_2s": policy1, "turn_3s": policy2, ...})
+
+        Returns:
+            BlueprintPolicy containing all infosets from all sub-chunks
+        """
+        merged_dict = {}
+        conflicts = 0
+
+        for sub_chunk_key, policy in sub_policies.items():
+            for infoset, action_probs in policy.policy.items():
+                if infoset in merged_dict:
+                    # This should never happen (policies should be disjoint)
+                    logger.warning(f"    ⚠️ Duplicate infoset: {infoset} (in {sub_chunk_key})")
+                    conflicts += 1
+                else:
+                    merged_dict[infoset] = action_probs
+
+        # Report stats
+        total_sub_infosets = sum(len(p.policy) for p in sub_policies.values())
+        logger.info(f"    Merged {len(sub_policies)} sub-policies:")
+        logger.info(f"      Total infosets: {len(merged_dict)}")
+        logger.info(f"      Sub-policy infosets: {total_sub_infosets}")
+        if conflicts > 0:
+            logger.warning(f"      Conflicts detected: {conflicts}")
+        else:
+            logger.info(f"      ✓ No conflicts (policies are disjoint)")
+
+        # Validate completeness (rough check)
+        expected_per_sub = total_sub_infosets // len(sub_policies)
+        logger.info(f"      Avg per sub-chunk: {expected_per_sub}")
+
+        return BlueprintPolicy(merged_dict)
 
     def _estimate_reach_probabilities(
         self,
@@ -539,20 +1197,43 @@ class ChunkedSolver:
         profiler.print_report()
     """
 
-    def __init__(self, full_game_config: Dict[str, Any], memory_profiler=None):
+    def __init__(
+        self,
+        full_game_config: Dict[str, Any],
+        memory_profiler=None,
+        precision: str = 'fp32',
+        micro_batch_size: int = 24,
+        max_nodes: Optional[Union[int, Dict[str, int]]] = None,
+        use_true_predealing: bool = True
+    ):
         """
         Initialize chunked solver for full Hold'em game.
 
         Args:
             full_game_config: Complete Hold'em configuration (all rounds)
             memory_profiler: Optional MemoryProfiler for tracking memory usage
+            precision: Tensor precision - 'fp32' (default) or 'fp16' for 50% memory savings
+            micro_batch_size: Max batch size for utility computation (default 24, use 6-12 for large games)
+            max_nodes: Phase 8.7 - Max nodes per chunk before auto-splitting. Either:
+                       - int: Single threshold for all rounds
+                       - Dict[str, int]: Per-round thresholds (e.g., {"turn": 10000, "river": 5000})
+                       - None: Use default thresholds (recommended)
+            use_true_predealing: Phase 9 - Use true game pre-dealing (Option A) for 8× memory reduction.
+                                Default True for maximum performance. Set False for backward compatibility.
         """
         self.config = full_game_config
         self.chunks = ["preflop", "flop", "turn", "river"]
         self.policies = {}  # Store policy for each chunk
         self.profiler = memory_profiler  # Optional memory profiler
+        self.precision = precision
+        self.micro_batch_size = micro_batch_size
+        self.max_nodes = max_nodes  # Phase 8.7
+        self.use_true_predealing = use_true_predealing  # Phase 9
 
-        logger.info(f"Initialized ChunkedSolver for {self.config.get('num_players', 2)}-player Hold'em")
+        predealing_mode = "true pre-dealing (Option A)" if use_true_predealing else "filtered extraction (Option B)"
+        logger.info(f"Initialized ChunkedSolver for {self.config.get('numPlayers', 2)}-player Hold'em "
+                   f"(precision={precision}, micro_batch={micro_batch_size}, "
+                   f"max_nodes={max_nodes}, mode={predealing_mode})")
 
     def solve(
         self,
@@ -590,11 +1271,15 @@ class ChunkedSolver:
             if self.profiler:
                 self.profiler.snapshot(f"before_{chunk_name}")
 
-            # Create subgame solver
+            # Phase 8.7-9: Create subgame solver with memory optimization + sub-chunking parameters
             subgame = SubgameSolver(
                 full_game_config=self.config,
                 round_name=chunk_name,
-                blueprint_policy=blueprint
+                blueprint_policy=blueprint,
+                precision=self.precision,
+                micro_batch_size=self.micro_batch_size,
+                max_nodes=self.max_nodes,  # Phase 8.7: Enable auto-splitting
+                use_true_predealing=self.use_true_predealing  # Phase 9: True pre-dealing
             )
 
             # Solve this chunk

@@ -101,12 +101,16 @@ class GameTreeConverter:
 
         logger.info(f"Initialized GameTreeConverter for {game.get_type().short_name}")
 
-    def build_matrices(self) -> MatrixRepresentation:
+    def build_matrices(self, starting_state: Optional[pyspiel.State] = None) -> MatrixRepresentation:
         """
         Build all matrix representations of the game tree.
 
         This is where the magic happens - we traverse the game tree once
         and construct sparse matrices that represent all possible transitions.
+
+        Args:
+            starting_state: Phase 9 - Optional custom starting state for true pre-dealing.
+                           If None, uses game.new_initial_state() (default behavior).
 
         Returns:
             MatrixRepresentation containing all matrices needed for GPU CFR
@@ -114,7 +118,13 @@ class GameTreeConverter:
         logger.info("Building matrix representation of game tree...")
 
         # Step 1: Traverse tree and collect all nodes
-        initial_state = self.game.new_initial_state()
+        if starting_state is not None:
+            # Phase 9: Start from custom state (true pre-dealing)
+            initial_state = starting_state.clone()  # Clone to avoid modifying original
+        else:
+            # Default: Start from game's initial state
+            initial_state = self.game.new_initial_state()
+
         self._traverse_tree(initial_state, depth=0, parent_id=-1)
 
         logger.info(f"  Enumerated {len(self.nodes)} nodes at {self.max_depth + 1} levels")

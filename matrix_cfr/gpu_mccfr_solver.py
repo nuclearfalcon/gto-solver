@@ -348,6 +348,70 @@ class GPUMCCFRSolver:
 
         return states_list, actions_list, players_list, terminal_payoffs
 
+    def _compute_cfv_recursive(
+        self,
+        state: Any,
+        updating_player: int,
+        reach_prob: float = 1.0
+    ) -> float:
+        """
+        Recursively compute counterfactual value for updating player.
+
+        This is the core of External Sampling MCCFR. It computes the
+        expected value for the updating player assuming they reach this
+        state, while opponents play according to their current strategies.
+
+        Args:
+            state: Current game state
+            updating_player: Player whose CFV we're computing
+            reach_prob: Probability of reaching this state (for weighting)
+
+        Returns:
+            Counterfactual value for updating player
+        """
+        # Terminal state: return payoff
+        if self.game_engine.is_terminal(state):
+            payoffs = self.game_engine.payoffs(state)
+            return float(payoffs[updating_player])
+
+        player = int(state.acting_player)
+        legal_mask = self.game_engine.legal_actions(state)
+
+        # If updating player acts: compute value for each action
+        if player == updating_player:
+            # Get current strategy
+            infoset = self.game_engine.state_to_infoset(state, player)
+            legal_np = np.array(legal_mask, dtype=bool)
+            strategy = self.regret_tables[player].get_strategy(infoset, legal_np)
+
+            # Compute expected value across all actions
+            value = 0.0
+            for a in range(len(legal_mask)):
+                if legal_mask[a]:
+                    # Recurse with this action
+                    new_state = self.game_engine.apply_action(state, a)
+                    action_value = self._compute_cfv_recursive(
+                        new_state, updating_player, reach_prob * strategy[a]
+                    )
+                    value += strategy[a] * action_value
+
+            return value
+
+        else:
+            # Opponent acts: sample according to their strategy
+            infoset = self.game_engine.state_to_infoset(state, player)
+            legal_np = np.array(legal_mask, dtype=bool)
+            strategy = self.regret_tables[player].get_strategy(infoset, legal_np)
+
+            # Sample opponent's action
+            legal_actions = [a for a in range(len(legal_mask)) if legal_mask[a]]
+            action_probs = strategy[legal_mask]
+            action = np.random.choice(legal_actions, p=action_probs)
+
+            # Recurse with sampled action
+            new_state = self.game_engine.apply_action(state, int(action))
+            return self._compute_cfv_recursive(new_state, updating_player, reach_prob)
+
     def compute_counterfactual_values(
         self,
         states: list,
@@ -360,9 +424,11 @@ class GPUMCCFRSolver:
         Compute counterfactual values for regret updates.
 
         For each decision point where updating_player acted:
-        - Compute value of action taken
-        - Compute values of alternative actions
+        - Compute value of action taken (actual trajectory value)
+        - Compute values of alternative actions (via recursion)
         - Regret = alternative_value - taken_value
+
+        This is the IMPROVED version using recursive CFV computation.
 
         Args:
             states: List of states visited
@@ -376,9 +442,7 @@ class GPUMCCFRSolver:
         """
         updates = []
 
-        # For now: Simple implementation using terminal payoffs
-        # Future optimization: Recursive CFV computation
-
+        # Process trajectory backwards for accurate CFV computation
         for i, (state, action, player) in enumerate(zip(states, actions, players)):
             if player != updating_player:
                 continue
@@ -388,29 +452,22 @@ class GPUMCCFRSolver:
             legal_mask = self.game_engine.legal_actions(state)
             legal_np = np.array(legal_mask, dtype=bool)
 
-            # Simplified regret computation:
-            # For action taken: use terminal payoff
-            # For alternatives: assume same payoff (baseline)
-            # This is a simplification - full MCCFR would simulate alternatives
-
-            value_taken = float(payoffs[player])
-
-            # Compute regrets: alternative_value - taken_value
-            # For now: use uniform baseline for alternatives
-            regrets = np.zeros(self.config.num_actions, dtype=np.float32)
-
-            # All legal actions get same counterfactual value as baseline
-            # Taken action gets 0 regret, others get (baseline - value)
-            # This is placeholder logic - full MCCFR more sophisticated
+            # Compute CFV for each legal action
+            action_values = np.zeros(self.config.num_actions, dtype=np.float32)
 
             for a in range(self.config.num_actions):
                 if legal_np[a]:
-                    if a == action:
-                        regrets[a] = 0.0
-                    else:
-                        # Alternative action: assign small positive regret if we won
-                        # This encourages exploration
-                        regrets[a] = 0.1 * value_taken if value_taken > 0 else 0.0
+                    # Apply action and compute CFV
+                    new_state = self.game_engine.apply_action(state, a)
+                    action_values[a] = self._compute_cfv_recursive(new_state, updating_player)
+
+            # Compute regrets: CFV(alternative) - CFV(taken_action)
+            regrets = np.zeros(self.config.num_actions, dtype=np.float32)
+            taken_value = action_values[action]
+
+            for a in range(self.config.num_actions):
+                if legal_np[a]:
+                    regrets[a] = action_values[a] - taken_value
 
             updates.append((infoset, action, regrets))
 

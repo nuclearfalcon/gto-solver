@@ -26,8 +26,32 @@ __author__ = 'GTO Poker Training Project'
 # Import main classes when package is imported
 from .matrix_cfr_solver import MatrixCFRSolver
 from .game_to_matrix import GameTreeConverter
+from .gpu_memory import (
+    MemoryProfiler,
+    GPUMemoryManager,
+    profile_memory,
+    get_cpu_memory_mb,
+    get_gpu_memory_mb,
+    get_array_memory_mb,
+    get_sparse_memory_mb,
+)
+from .subgame_solver import (
+    SubgameSolver,
+    ChunkedSolver,
+    BlueprintPolicy,
+)
 
 __all__ = [
     'MatrixCFRSolver',
     'GameTreeConverter',
+    'MemoryProfiler',
+    'GPUMemoryManager',
+    'profile_memory',
+    'get_cpu_memory_mb',
+    'get_gpu_memory_mb',
+    'get_array_memory_mb',
+    'get_sparse_memory_mb',
+    'SubgameSolver',
+    'ChunkedSolver',
+    'BlueprintPolicy',
 ]

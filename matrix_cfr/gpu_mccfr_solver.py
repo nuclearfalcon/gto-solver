@@ -1432,9 +1432,11 @@ class GPUMCCFRSolver:
         del flat_bucket_indices, flat_regret_deltas, strategies
         gc.collect()
 
-        # EXPERIMENTAL: Clear JAX compilation cache every 10 iterations to prevent memory accumulation
-        # This may help with memory leaks from JAX's internal caching of traced computations
-        if self.iteration % 10 == 0:
+        # Clear JAX compilation cache periodically to prevent memory accumulation
+        # Trade-off: More frequent clearing = less memory but slower (due to recompilation)
+        # Recommended: 20-50 for speed, 10 for minimum memory
+        cache_clear_interval = getattr(self.config, 'cache_clear_interval', 20)
+        if cache_clear_interval > 0 and self.iteration % cache_clear_interval == 0:
             jax.clear_caches()
 
         return total_trajectory_length

@@ -1,0 +1,21 @@
+{
+  "num_players": 2,
+  "stacks": [
+    500.0,
+    500.0
+  ],
+  "blinds": [
+    50.0,
+    100.0
+  ],
+  "iterations": 100,
+  "batch_size": 200,
+  "num_buckets": 5000,
+  "num_hand_buckets": 100,
+  "num_pot_buckets": 5,
+  "num_actions": 4,
+  "seed": 42,
+  "training_time_seconds": 689.6752619743347,
+  "final_speed_it_per_sec": 0.14499577629293214,
+  "final_throughput_traj_per_sec": 28.999155258586427
+}

@@ -45,6 +45,9 @@ class GPUMCCFRConfig:
     prune_threshold: float = -3e8  # Prune actions with very negative regrets
     checkpoint_interval: int = 10_000  # Save checkpoint every N iterations
 
+    # Performance tuning
+    cache_clear_interval: int = 20  # Clear JAX cache every N iterations (0 = never, 10 = min memory, 20-50 = speed)
+
     # Optional metadata
     name: Optional[str] = None
     description: Optional[str] = None

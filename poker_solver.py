@@ -311,7 +311,10 @@ class UnifiedPokerSolver:
         sampled_exploit_confidence: float = 0.99,
         sampled_exploit_ci_width: float = 0.05,
         sampled_exploit_min_samples: int = 50,
-        sampled_exploit_max_samples: int = 500
+        sampled_exploit_max_samples: int = 500,
+        save_best_policy: bool = True,
+        use_table_display: bool = True,
+        exploit_history_size: int = 10
     ):
         """
         Run solver for specified iterations.
@@ -332,6 +335,9 @@ class UnifiedPokerSolver:
             sampled_exploit_ci_width: Target CI width for sampled exploitability (default: 0.05 = 5%)
             sampled_exploit_min_samples: Minimum samples for sampled exploitability (default: 50)
             sampled_exploit_max_samples: Maximum samples for sampled exploitability (default: 500)
+            save_best_policy: Automatically save best policy when found (default: True)
+            use_table_display: Use table-based progress display instead of text (default: True)
+            exploit_history_size: Number of recent exploitability tests to show in table (default: 10)
         """
         if adaptive_schedule is None:
             adaptive_schedule = AdaptiveSchedule()
@@ -399,15 +405,25 @@ class UnifiedPokerSolver:
                 memory_mb = self.metrics_tracker.process.memory_info().rss / (1024 * 1024)
                 next_check = adaptive_schedule.get_next_check(self.current_iteration)
 
-                # Log progress with last known exploitability
-                self.logger.log_progress_simple(
-                    iteration=self.current_iteration,
-                    time_elapsed=elapsed,
-                    iters_per_sec=iters_per_sec,
-                    memory_mb=memory_mb,
-                    next_check=next_check,
-                    last_exploitability=last_exploitability
-                )
+                # Use table display or simple text
+                if use_table_display:
+                    self.logger.log_progress_table_row(
+                        iteration=self.current_iteration,
+                        time_elapsed=elapsed,
+                        iters_per_sec=iters_per_sec,
+                        memory_mb=memory_mb,
+                        last_exploitability=last_exploitability
+                    )
+                else:
+                    # Original simple text progress
+                    self.logger.log_progress_simple(
+                        iteration=self.current_iteration,
+                        time_elapsed=elapsed,
+                        iters_per_sec=iters_per_sec,
+                        memory_mb=memory_mb,
+                        next_check=next_check,
+                        last_exploitability=last_exploitability
+                    )
 
                 # Memory management
                 if self.current_iteration % 1000 == 0:
@@ -449,16 +465,30 @@ class UnifiedPokerSolver:
                 latest = self.metrics_tracker.get_latest_checkpoint()
                 next_check = adaptive_schedule.get_next_check(self.current_iteration)
 
-                # Log full progress with exploitability
-                self.logger.log_progress(
-                    iteration=self.current_iteration,
-                    exploitability=exploitability_value,
-                    time_elapsed=latest.time_elapsed,
-                    iters_per_sec=latest.iters_per_sec,
-                    memory_mb=latest.memory_mb,
-                    next_check=next_check,
-                    convergence_rate=latest.convergence_rate
-                )
+                # Check if this is a new best and save if requested
+                is_new_best = (self.metrics_tracker.best_iteration == self.current_iteration)
+                if is_new_best and save_best_policy:
+                    best_path = self._save_best_policy(checkpoint_dir, checkpoint_prefix)
+                    self.logger.log_info(f"★ NEW BEST policy saved: {best_path} (exploit: {exploitability_value:.6f})")
+
+                # Display exploitability history table
+                if use_table_display:
+                    recent_checkpoints = self.metrics_tracker.get_recent_checkpoints(exploit_history_size)
+                    self.logger.log_exploitability_table(
+                        recent_checkpoints,
+                        best_iteration=self.metrics_tracker.best_iteration
+                    )
+                else:
+                    # Original simple text progress
+                    self.logger.log_progress(
+                        iteration=self.current_iteration,
+                        exploitability=exploitability_value,
+                        time_elapsed=latest.time_elapsed,
+                        iters_per_sec=latest.iters_per_sec,
+                        memory_mb=latest.memory_mb,
+                        next_check=next_check,
+                        convergence_rate=latest.convergence_rate
+                    )
 
                 last_check_iteration = self.current_iteration
 
@@ -549,6 +579,39 @@ class UnifiedPokerSolver:
             pickle.dump(avg_policy, f, pickle.HIGHEST_PROTOCOL)
 
         self.logger.log_info(f"Policy saved to: {policy_path}")
+
+    def _save_best_policy(self, checkpoint_dir: str, checkpoint_prefix: Optional[str] = None) -> str:
+        """
+        Save best policy encountered so far.
+
+        Args:
+            checkpoint_dir: Directory to save policy
+            checkpoint_prefix: Optional prefix for filename (default: algorithm name)
+
+        Returns:
+            Path to saved policy
+        """
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+        # Use prefix or default to algorithm name
+        if checkpoint_prefix is None:
+            prefix = self.algorithm
+        else:
+            prefix = checkpoint_prefix
+
+        best_policy_path = f"{checkpoint_dir}/{prefix}_best_policy.pkl"
+
+        avg_policy = self.get_average_policy()
+        with open(best_policy_path, 'wb') as f:
+            pickle.dump({
+                'policy': avg_policy,
+                'iteration': self.current_iteration,
+                'exploitability': self.metrics_tracker.best_exploitability,
+                'algorithm': self.algorithm,
+                'game_config': self.game_config
+            }, f, pickle.HIGHEST_PROTOCOL)
+
+        return best_policy_path
 
     def _save_checkpoint(self, checkpoint_dir: str, checkpoint_prefix: Optional[str] = None) -> str:
         """

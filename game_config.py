@@ -26,9 +26,56 @@ Example:
 
 import json
 import pyspiel
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+
+
+@dataclass
+class SolverSettings:
+    """
+    Optional solver configuration settings.
+
+    These settings can be specified in config files to provide defaults
+    for solver behavior. CLI arguments override these settings.
+
+    Attributes:
+        output_dir: Directory for results files
+        checkpoint_dir: Directory for checkpoint files
+        results_prefix: Custom prefix for result filenames
+        best_policy_filename: Filename for best policy (None = auto-generate)
+        max_iterations: Maximum iterations to run
+        checkpoint_interval: Save checkpoint every N iterations
+        progress_interval: Show progress update every N iterations
+        exploitability_schedule: "adaptive" or "fixed"
+        check_interval: Fixed interval for exploitability checks (if not adaptive)
+        save_best_policy: Whether to automatically save best policy
+        auto_resume: Automatically resume from checkpoint without prompt
+        exploit_history_size: Number of recent exploitability tests to show (default: 10)
+    """
+    # Output paths
+    output_dir: str = "results"
+    checkpoint_dir: str = "checkpoints"
+    results_prefix: Optional[str] = None
+    best_policy_filename: Optional[str] = None
+
+    # Iteration settings
+    max_iterations: Optional[int] = None
+    checkpoint_interval: Optional[int] = None
+    progress_interval: int = 100
+
+    # Exploitability settings
+    exploitability_schedule: str = "adaptive"  # "adaptive" or "fixed"
+    check_interval: Optional[int] = None
+
+    # Best policy tracking
+    save_best_policy: bool = True
+
+    # Auto-resume
+    auto_resume: bool = False
+
+    # Display settings
+    exploit_history_size: int = 10
 
 
 @dataclass
@@ -70,6 +117,9 @@ class PokerGameConfig:
 
     # Metadata
     description: str = ""
+
+    # Optional solver settings
+    solver_settings: Optional[SolverSettings] = None
 
     def __post_init__(self):
         """Validate configuration."""
@@ -191,7 +241,11 @@ class PokerGameConfig:
         Returns:
             PokerGameConfig instance
         """
-        return cls(**data)
+        # Handle solver_settings if present
+        data_copy = data.copy()
+        if 'solver_settings' in data_copy and data_copy['solver_settings'] is not None:
+            data_copy['solver_settings'] = SolverSettings(**data_copy['solver_settings'])
+        return cls(**data_copy)
 
     @classmethod
     def from_json(cls, filepath: str) -> 'PokerGameConfig':

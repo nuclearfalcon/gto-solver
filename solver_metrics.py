@@ -65,6 +65,10 @@ class MetricsTracker:
         self.process = psutil.Process(os.getpid())
         self.sampled_exploitability_result: Optional[Dict] = None  # Final sampled exploit result
 
+        # Track best exploitability
+        self.best_exploitability: Optional[float] = None
+        self.best_iteration: Optional[int] = None
+
     def record_checkpoint(
         self,
         iteration: int,
@@ -106,6 +110,11 @@ class MetricsTracker:
 
         self.checkpoints.append(checkpoint)
 
+        # Update best exploitability if this is better
+        if self.best_exploitability is None or exploitability < self.best_exploitability:
+            self.best_exploitability = exploitability
+            self.best_iteration = iteration
+
     def record_sampled_exploitability(self, result: Dict):
         """
         Record final sampled exploitability result.
@@ -132,6 +141,33 @@ class MetricsTracker:
         """Get most recent checkpoint."""
         return self.checkpoints[-1] if self.checkpoints else None
 
+    def get_recent_checkpoints(self, n: int = 10) -> List[MetricCheckpoint]:
+        """
+        Get the N most recent checkpoints.
+
+        Args:
+            n: Number of recent checkpoints to return
+
+        Returns:
+            List of recent checkpoints (oldest to newest)
+        """
+        if not self.checkpoints:
+            return []
+        return self.checkpoints[-n:] if len(self.checkpoints) >= n else self.checkpoints
+
+    def is_best_checkpoint(self, checkpoint: MetricCheckpoint) -> bool:
+        """
+        Check if a checkpoint represents the best exploitability.
+
+        Args:
+            checkpoint: Checkpoint to check
+
+        Returns:
+            True if this is the best checkpoint
+        """
+        return (self.best_iteration is not None and
+                checkpoint.iteration == self.best_iteration)
+
     def get_convergence_summary(self) -> Dict[str, Any]:
         """
         Get summary statistics.
@@ -156,6 +192,8 @@ class MetricsTracker:
             'final_exploitability': latest.exploitability,
             'initial_exploitability': exploitabilities[0] if exploitabilities else None,
             'min_exploitability': min(exploitabilities) if exploitabilities else None,
+            'best_exploitability': self.best_exploitability,
+            'best_iteration': self.best_iteration,
             'avg_iters_per_sec': sum(iters_per_sec_values) / len(iters_per_sec_values),
             'peak_memory_mb': max(memory_values) if memory_values else None,
             'num_checkpoints': len(self.checkpoints),

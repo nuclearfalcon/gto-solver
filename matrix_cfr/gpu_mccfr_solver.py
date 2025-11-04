@@ -22,6 +22,7 @@ from jax import random
 import numpy as np
 from dataclasses import dataclass
 import time
+import gc
 
 
 # State flattening/unflattening for efficient GPU storage (Phase 10.4 Option 1)
@@ -131,6 +132,46 @@ def unflatten_state(flat: jnp.ndarray, num_players: int):
         folded=folded,
         all_in=all_in
     )
+
+
+# Module-level JIT-compiled bucketing function (prevents recompilation on every iteration)
+def create_batch_bucketing_fn(num_players, num_buckets, num_hand_buckets, num_pot_buckets):
+    """
+    Create a JIT-compiled batch bucketing function with fixed parameters.
+
+    This function is created ONCE and reused across all iterations to prevent
+    the memory leak from redefining JIT functions inside the training loop.
+
+    Args:
+        num_players: Number of players (static, baked into JIT)
+        num_buckets: Total number of buckets
+        num_hand_buckets: Hand strength buckets per round
+        num_pot_buckets: Pot size buckets
+
+    Returns:
+        JIT-compiled function that maps (states_batch, updating_player) -> bucket_indices
+    """
+    from functools import partial
+    from matrix_cfr.bucketing import state_to_bucket_index_flat
+
+    @jax.jit
+    def batch_convert_states_to_buckets(states_flat_2d, updating_player_const):
+        """JIT-compiled vectorized state→bucket conversion (flat version - no memory leak)."""
+        # Bind num_players as constant using partial (required for JIT with dynamic slicing)
+        flat_to_bucket = partial(
+            state_to_bucket_index_flat,
+            num_players=num_players,  # Static constant
+            updating_player=updating_player_const,
+            num_buckets=num_buckets,
+            num_hand_buckets=num_hand_buckets,
+            num_pot_buckets=num_pot_buckets
+        )
+
+        # Vectorize over all states
+        vectorized_bucketing = jax.vmap(flat_to_bucket)
+        return vectorized_bucketing(states_flat_2d)
+
+    return batch_convert_states_to_buckets
 
 
 class RegretTable:
@@ -572,10 +613,23 @@ class GPUMCCFRSolver:
         self.key = random.PRNGKey(seed)
 
         # Regret tables (one per player)
-        self.regret_tables = [RegretTable() for _ in range(config.num_players)]
+        # Use GPURegretTable if config has num_buckets (GPU-resident with bucketing)
+        # Otherwise use CPU RegretTable (for backward compatibility)
+        if hasattr(config, 'num_buckets') and hasattr(config, 'num_actions'):
+            self.regret_tables = [
+                GPURegretTable(num_buckets=config.num_buckets, num_actions=config.num_actions)
+                for _ in range(config.num_players)
+            ]
+        else:
+            self.regret_tables = [RegretTable() for _ in range(config.num_players)]
 
         # Iteration counter
         self.iteration = 0
+
+        # Cached JIT-compiled bucketing function (for GPU-resident mode)
+        # Initialize as None, will be created on first call to run_iteration_gpu_resident
+        self._batch_bucketing_fn = None
+        self._bucketing_params = None  # Cache parameters to detect changes
 
         # Metrics
         self.metrics = {
@@ -1141,7 +1195,7 @@ class GPUMCCFRSolver:
             Total trajectory length for metrics
         """
         from matrix_cfr.bucketing import (
-            state_to_bucket_index,
+            state_to_bucket_index_flat,  # MEMORY-LEAK-FREE flat version
             compute_cfvs_vectorized,
             compute_regret_deltas_vectorized
         )
@@ -1165,25 +1219,17 @@ class GPUMCCFRSolver:
                 max_actions=50
             )
 
-        # GPU: Convert states to bucket indices (VECTORIZED + JIT!)
-        # Define JIT-compiled vectorized bucketing function
-        @jax.jit
-        def batch_convert_states_to_buckets(states_flat_2d, updating_player_const):
-            """JIT-compiled vectorized state→bucket conversion."""
-            def flatten_to_bucket(flat_state):
-                """Convert a single flattened state to bucket index (vectorizable)."""
-                state = unflatten_state(flat_state, num_players)
-                return state_to_bucket_index(
-                    state,
-                    updating_player_const,
-                    num_buckets,
-                    num_hand_buckets,
-                    num_pot_buckets
-                )
+        # GPU: Convert states to bucket indices (VECTORIZED + JIT - NO NAMEDTUPLES!)
+        # CRITICAL FIX: Use cached JIT function to prevent recompilation memory leak
 
-            # Vectorize over all states
-            vectorized_bucketing = jax.vmap(flatten_to_bucket)
-            return vectorized_bucketing(states_flat_2d)
+        # Create or reuse cached JIT-compiled bucketing function
+        bucketing_params = (num_players, num_buckets, num_hand_buckets, num_pot_buckets)
+        if self._batch_bucketing_fn is None or self._bucketing_params != bucketing_params:
+            # First call or parameters changed - create new JIT function
+            self._batch_bucketing_fn = create_batch_bucketing_fn(
+                num_players, num_buckets, num_hand_buckets, num_pot_buckets
+            )
+            self._bucketing_params = bucketing_params
 
         # Vectorize over both batch and time dimensions
         batch_size_actual, max_length, state_size = states_batch.shape
@@ -1191,8 +1237,8 @@ class GPUMCCFRSolver:
         # Reshape to (batch * max_length, state_size) for vectorization
         states_flat_2d = states_batch.reshape(-1, state_size)
 
-        # Apply JIT-compiled vectorized bucketing (THE KEY OPTIMIZATION!)
-        bucket_indices_flat = batch_convert_states_to_buckets(states_flat_2d, updating_player)
+        # Apply cached JIT-compiled vectorized bucketing (NO NAMEDTUPLE, NO REDEFINITION!)
+        bucket_indices_flat = self._batch_bucketing_fn(states_flat_2d, updating_player)
 
         # Reshape back to (batch, max_length)
         bucket_indices = bucket_indices_flat.reshape(batch_size_actual, max_length)
@@ -1252,6 +1298,14 @@ class GPUMCCFRSolver:
 
         # Calculate total trajectory length for metrics
         total_trajectory_length = int(jnp.sum(num_steps_array))
+
+        # CRITICAL: Explicit garbage collection AND array cleanup
+        # Force JAX to release cached arrays and Python to clean up temporaries
+        del states_batch, actions_batch, players_batch, valid_masks, payoffs_batch
+        del states_flat_2d, bucket_indices_flat, bucket_indices
+        del cfvs, regret_deltas, is_updating_player
+        del flat_bucket_indices, flat_regret_deltas, strategies
+        gc.collect()
 
         return total_trajectory_length
 

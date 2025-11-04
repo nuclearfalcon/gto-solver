@@ -67,6 +67,10 @@ class SolverLogger:
         # Force flush after each message
         self.handler = handler
 
+        # Track header display for table updates
+        self.table_update_count = 0
+        self.table_header_interval = 50  # Reprint header every N updates
+
     def _log_and_flush(self, message: str):
         """Log message and flush to ensure immediate output."""
         self.logger.info(message)
@@ -81,6 +85,113 @@ class SolverLogger:
         if self.max_iterations:
             self._log_and_flush(f"  Target iterations: {self.max_iterations:,}")
         self._log_and_flush("=" * 80)
+
+    def log_progress_table_header(self):
+        """
+        Log the table header for progress updates.
+        """
+        header = f"{'Iteration':>12} │ {'Progress':>8} │ {'Rate':>10} │ {'Elapsed':>10} │ {'Memory':>8} │ {'Last Expl':>12} │ {'ETA':>10}"
+        separator = "─" * 12 + "─┼─" + "─" * 8 + "─┼─" + "─" * 10 + "─┼─" + "─" * 10 + "─┼─" + "─" * 8 + "─┼─" + "─" * 12 + "─┼─" + "─" * 10
+
+        self._log_and_flush(separator)
+        self._log_and_flush(header)
+        self._log_and_flush(separator)
+
+    def log_progress_table_row(
+        self,
+        iteration: int,
+        time_elapsed: float,
+        iters_per_sec: float,
+        memory_mb: float,
+        last_exploitability: float
+    ):
+        """
+        Log a single table row for progress (uses carriage return to update in place).
+
+        Args:
+            iteration: Current iteration
+            time_elapsed: Time elapsed in seconds
+            iters_per_sec: Iterations per second
+            memory_mb: Memory usage in MB
+            last_exploitability: Last known exploitability value
+        """
+        # Reprint header periodically
+        if self.table_update_count % self.table_header_interval == 0:
+            self.log_progress_table_header()
+
+        self.table_update_count += 1
+
+        # Calculate progress and ETA
+        if self.max_iterations:
+            progress_pct = (iteration / self.max_iterations) * 100
+            progress_str = f"{progress_pct:7.2f}%"
+
+            # Calculate ETA
+            remaining_iters = self.max_iterations - iteration
+            if iters_per_sec > 0:
+                eta_seconds = remaining_iters / iters_per_sec
+                eta_str = format_time(eta_seconds)
+            else:
+                eta_str = "Unknown"
+        else:
+            progress_str = "N/A"
+            eta_str = "N/A"
+
+        # Format values
+        iter_str = f"{iteration:,}"
+        rate_str = f"{iters_per_sec:.1f} it/s"
+        time_str = format_time(time_elapsed)
+        mem_str = format_memory(memory_mb)
+        exploit_str = f"{last_exploitability:.6f}"
+
+        # Build row
+        row = f"{iter_str:>12} │ {progress_str:>8} │ {rate_str:>10} │ {time_str:>10} │ {mem_str:>8} │ {exploit_str:>12} │ {eta_str:>10}"
+
+        # Use carriage return to overwrite the same line
+        sys.stdout.write('\r' + row)
+        sys.stdout.flush()
+
+    def log_exploitability_table(self, recent_checkpoints: list, best_iteration: int = None):
+        """
+        Log a table of recent exploitability measurements.
+
+        Args:
+            recent_checkpoints: List of MetricCheckpoint objects (oldest to newest)
+            best_iteration: Iteration with best exploitability (to mark with ★)
+        """
+        if not recent_checkpoints:
+            return
+
+        # Print on new line after table row updates
+        self._log_and_flush("")  # Move to new line
+        self._log_and_flush("")
+        self._log_and_flush(f"Recent Exploitability Tests (last {len(recent_checkpoints)}):")
+
+        # Header
+        header = f"{'Iteration':>12} │ {'Exploitability':>16} │ {'Time':>12} │ {'Status':>10}"
+        separator = "─" * 12 + "─┼─" + "─" * 16 + "─┼─" + "─" * 12 + "─┼─" + "─" * 10
+
+        self._log_and_flush(separator)
+        self._log_and_flush(header)
+        self._log_and_flush(separator)
+
+        # Rows
+        for checkpoint in recent_checkpoints:
+            iter_str = f"{checkpoint.iteration:,}"
+            exploit_str = f"{checkpoint.exploitability:.6f}"
+            time_str = format_time(checkpoint.time_elapsed)
+
+            # Mark best with star
+            if best_iteration is not None and checkpoint.iteration == best_iteration:
+                status_str = "★ BEST"
+            else:
+                status_str = ""
+
+            row = f"{iter_str:>12} │ {exploit_str:>16} │ {time_str:>12} │ {status_str:>10}"
+            self._log_and_flush(row)
+
+        self._log_and_flush(separator)
+        self._log_and_flush("")
 
     def log_progress_simple(
         self,

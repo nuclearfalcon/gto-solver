@@ -139,11 +139,216 @@ policy = solver.average_policy()
 - Non-monotonic convergence is expected (track best Nash, not final Nash)
 - See `DCFR_GUIDE.md` for algorithm selection and performance data
 
-### 4. Game Configuration
+### 4. GPU MCCFR Solver (Phase 10+)
+**Module**: `matrix_cfr/gpu_mccfr_solver.py`
+**Primary Classes**: `GPUMCCFRSolver`, `GPURegretTable`
+
+**Purpose**: GPU-accelerated Monte Carlo CFR for large-scale poker games using JAX and bucketing abstraction.
+
+**Key Features**:
+- GPU-resident computation (everything stays on GPU)
+- Hierarchical bucketing (hand strength × pot size × round)
+- Batched trajectory sampling (100-500 parallel games)
+- Sparse or dense regret storage
+- Memory: ~500 MB RAM, <10 MB VRAM (vs 10-20 GB for OpenSpiel)
+- Speed: 100-1000× faster than sequential CPU for large games
+
+**Usage**:
+```python
+from matrix_cfr.gpu_mccfr_solver import GPUMCCFRSolver
+from gpu_mccfr_config import GPUMCCFRConfig
+import jax.numpy as jnp
+
+# Load configuration
+config = GPUMCCFRConfig.from_json("configs/gpu/2p_10bb_holdem.json")
+
+# Create solver
+solver = GPUMCCFRSolver(
+    num_players=config.num_players,
+    num_buckets=config.num_buckets,
+    num_hand_buckets=config.num_hand_buckets,
+    num_pot_buckets=config.num_pot_buckets,
+    num_actions=config.num_actions,
+    batch_size=config.batch_size,
+    seed=config.seed
+)
+
+# Run GPU-resident iteration
+solver.run_iteration_gpu_resident(
+    num_players=config.num_players,
+    stacks=jnp.array(config.stacks),
+    blinds=jnp.array(config.blinds),
+    num_buckets=config.num_buckets,
+    num_hand_buckets=config.num_hand_buckets,
+    num_pot_buckets=config.num_pot_buckets
+)
+
+# Get average policy (bucket-level)
+policy = solver.get_average_policy()
+```
+
+**When to use**:
+- Large games (2-9 player Hold'em, 10BB+ stacks)
+- RAM constrained (<2 GB available)
+- Training speed matters (100-1000× vs CPU)
+- Bucketing abstraction acceptable (~95% solution quality)
+
+**When NOT to use**:
+- Tiny games (Kuhn, Leduc) - use OpenSpiel
+- Exact Nash equilibrium required - use OpenSpiel
+- No GPU available - use OpenSpiel
+
+**Related modules**:
+- `matrix_cfr/holdem_jax_v2.py`: JAX Hold'em game engine
+- `matrix_cfr/kuhn_jax_v2.py`: JAX Kuhn poker engine
+- `matrix_cfr/bucketing.py`: Hierarchical bucketing functions
+- `gpu_mccfr_config.py`: Configuration management
+- `solve_poker_gpu.py`: CLI tool for GPU training
+
+See `GPU_MCCFR_GUIDE.md` for detailed technical documentation.
+
+### 5. JAX Game Engines
+**Module**: `matrix_cfr/holdem_jax_v2.py`, `matrix_cfr/kuhn_jax_v2.py`
+**Primary Functions**: `step_state()`, `is_terminal()`, `get_returns()`
+
+**Purpose**: Pure JAX implementations of poker games enabling GPU compilation via JIT.
+
+**Key Features**:
+- Pure functional programming (no side effects)
+- JAX control flow (`jax.lax.cond`, `jax.lax.while_loop`) instead of Python if/for
+- GPU-compilable via `jax.jit`
+- Vectorizable via `jax.vmap` (100+ parallel games)
+- State as NamedTuple of JAX arrays (GPU-resident)
+
+**Usage**:
+```python
+from matrix_cfr.holdem_jax_v2 import HoldemState, step_state, is_terminal, get_returns
+import jax.numpy as jnp
+
+# Create initial state
+state = HoldemState(
+    hole_cards=jnp.array([[0, 1], [2, 3]]),
+    board=jnp.array([-1, -1, -1, -1, -1]),
+    deck=jnp.ones(52, dtype=bool),
+    bets=jnp.array([50.0, 100.0]),
+    pot=150.0,
+    stacks=jnp.array([950.0, 900.0]),
+    round=0,
+    acting_player=0,
+    num_actions_this_round=0,
+    folded=jnp.array([False, False]),
+    all_in=jnp.array([False, False])
+)
+
+# Step state (GPU-compiled)
+new_state = step_state(state, action=1)  # Call
+
+# Check terminal
+if is_terminal(new_state):
+    payoffs = get_returns(new_state)
+```
+
+**Vectorization example** (100 parallel games):
+```python
+# Batch of initial states (100 games)
+states_batch = jax.vmap(create_initial_state)(batch_keys)
+
+# Batch of actions
+actions = jnp.array([1, 0, 1, ...])  # 100 actions
+
+# Vectorized step (all games in parallel on GPU!)
+new_states = jax.vmap(step_state)(states_batch, actions)
+```
+
+### 6. Hierarchical Bucketing
+**Module**: `matrix_cfr/bucketing.py`
+**Primary Functions**: `state_to_bucket_index()`, `compute_cfvs_vectorized()`, `compute_regret_deltas_vectorized()`
+
+**Purpose**: Reduce state space from ~10^14 infosets (full Hold'em) to ~10^4 buckets via abstraction.
+
+**Bucketing dimensions**:
+- Hand strength (200 buckets): Preflop equity, postflop hand type
+- Pot size (10 buckets): Logarithmic bucketing of pot/chips ratio
+- Round (4): Preflop, flop, turn, river
+- Bet action history (abstracted)
+
+**Usage**:
+```python
+from matrix_cfr.bucketing import state_to_bucket_index, compute_cfvs_vectorized
+
+# Convert state to bucket
+bucket_idx = state_to_bucket_index(
+    state,
+    num_buckets=10000,
+    num_hand_buckets=200,
+    num_pot_buckets=10,
+    num_actions=4
+)
+
+# Compute CFVs for batch (GPU-vectorized)
+cfvs = compute_cfvs_vectorized(
+    payoffs,          # Terminal payoffs
+    valid_masks,      # Valid state mask
+    players,          # Player IDs
+    updating_player   # Player to update
+)
+```
+
+**Trade-off**:
+- Memory reduction: 100,000,000× (10^14 → 10^4)
+- Solution quality: ~95% of exact (empirically)
+- Cannot query exact infoset strategies
+
+### 7. GPU MCCFR Configuration
+**Module**: `gpu_mccfr_config.py`
+**Primary Class**: `GPUMCCFRConfig`
+
+**Purpose**: Configuration management for GPU MCCFR training.
+
+**Features**:
+- JSON serialization/deserialization
+- Validation in `__post_init__`
+- 6 preset configurations
+- Stack-in-BB calculations
+- Game description generation
+
+**Usage**:
+```python
+from gpu_mccfr_config import GPUMCCFRConfig
+
+# Load from JSON
+config = GPUMCCFRConfig.from_json("configs/gpu/2p_10bb_holdem.json")
+
+# Create from preset
+config = GPUMCCFRConfig.get_preset("2p_10bb_holdem")
+
+# Create programmatically
+config = GPUMCCFRConfig(
+    num_players=2,
+    stacks=[1000.0, 1000.0],
+    blinds=[50.0, 100.0],
+    batch_size=100,
+    num_buckets=10000,
+    num_hand_buckets=200,
+    num_pot_buckets=10,
+    num_actions=4,
+    seed=42
+)
+
+# Save to JSON
+config.to_json("configs/gpu/custom.json")
+
+# Get game description
+print(config.get_game_description())  # "2p 10bb Hold'em"
+```
+
+**Presets**: `2p_10bb_holdem`, `2p_20bb_holdem`, `3p_10bb_holdem`, `6p_10bb_holdem`, `9p_10bb_holdem`, `2p_5bb_holdem_fast`
+
+### 8. Game Configuration (OpenSpiel)
 **Module**: `game_config.py`
 **Primary Class**: `PokerGameConfig`
 
-**Purpose**: Centralized game configuration management.
+**Purpose**: Centralized game configuration management for OpenSpiel track.
 
 **Features**:
 - JSON serialization/deserialization

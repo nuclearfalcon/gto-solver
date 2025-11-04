@@ -1,0 +1,388 @@
+[
+  {
+    "problem_id": "2p_preflop_00000",
+    "num_players": 2,
+    "hero_position": "BB",
+    "hero_cards": [
+      "2c"
+    ],
+    "stacks_bb": {
+      "BB": 4.0,
+      "BTN": 4.0
+    },
+    "pot_bb": 2.0,
+    "action_history": [
+      {
+        "player": "BTN",
+        "action": "Call"
+      }
+    ],
+    "active_players": [
+      "BB",
+      "BTN"
+    ],
+    "current_player": "BB",
+    "gto_strategy": {
+      "Call/Check": 0.6491369638283787,
+      "Bet/Raise (Small)": 0.014015018471475063,
+      "Bet/Raise (Pot)": 0.3368479289516325
+    },
+    "tags": [
+      "round_0",
+      "preflop",
+      "close_decision",
+      "small_pot"
+    ],
+    "hand_category": "unknown",
+    "info_state_str": "[Round 0][Player: 0][Pot: 200][Money: 400 400][Private: 2c][Public: ][Sequences: c]"
+  },
+  {
+    "problem_id": "2p_preflop_00001",
+    "num_players": 2,
+    "hero_position": "BB",
+    "hero_cards": [
+      "2c"
+    ],
+    "stacks_bb": {
+      "BB": 2.0,
+      "BTN": 0.0
+    },
+    "pot_bb": 10.0,
+    "action_history": [
+      {
+        "player": "BTN",
+        "action": "Call"
+      },
+      {
+        "player": "BB",
+        "action": "Raise to 3.0BB"
+      },
+      {
+        "player": "BTN",
+        "action": "Raise to 5.0BB"
+      }
+    ],
+    "active_players": [
+      "BB",
+      "BTN"
+    ],
+    "current_player": "BB",
+    "gto_strategy": {
+      "Call/Check": 0.9999998216377645
+    },
+    "tags": [
+      "round_0",
+      "preflop",
+      "facing_raise",
+      "large_pot"
+    ],
+    "hand_category": "unknown",
+    "info_state_str": "[Round 0][Player: 0][Pot: 1000][Money: 200 0][Private: 2c][Public: ][Sequences: cr300r500]"
+  },
+  {
+    "problem_id": "2p_preflop_00002",
+    "num_players": 2,
+    "hero_position": "BB",
+    "hero_cards": [
+      "2c"
+    ],
+    "stacks_bb": {
+      "BB": 3.0,
+      "BTN": 0.0
+    },
+    "pot_bb": 10.0,
+    "action_history": [
+      {
+        "player": "BTN",
+        "action": "Call"
+      },
+      {
+        "player": "BB",
+        "action": "Raise to 2.0BB"
+      },
+      {
+        "player": "BTN",
+        "action": "Raise to 5.0BB"
+      }
+    ],
+    "active_players": [
+      "BB",
+      "BTN"
+    ],
+    "current_player": "BB",
+    "gto_strategy": {
+      "Fold": 0.9020872928773966,
+      "Call/Check": 0.09791270712260328
+    },
+    "tags": [
+      "round_0",
+      "preflop",
+      "facing_raise",
+      "large_pot"
+    ],
+    "hand_category": "unknown",
+    "info_state_str": "[Round 0][Player: 0][Pot: 1000][Money: 300 0][Private: 2c][Public: ][Sequences: cr200r500]"
+  },
+  {
+    "problem_id": "2p_preflop_00003",
+    "num_players": 2,
+    "hero_position": "BB",
+    "hero_cards": [
+      "2c"
+    ],
+    "stacks_bb": {
+      "BB": 4.0,
+      "BTN": 2.0
+    },
+    "pot_bb": 6.0,
+    "action_history": [
+      {
+        "player": "BTN",
+        "action": "Raise to 3.0BB"
+      }
+    ],
+    "active_players": [
+      "BB",
+      "BTN"
+    ],
+    "current_player": "BB",
+    "gto_strategy": {
+      "Fold": 0.9999996153022025
+    },
+    "tags": [
+      "round_0",
+      "preflop",
+      "facing_raise"
+    ],
+    "hand_category": "unknown",
+    "info_state_str": "[Round 0][Player: 0][Pot: 600][Money: 400 200][Private: 2c][Public: ][Sequences: r300]"
+  },
+  {
+    "problem_id": "2p_preflop_00004",
+    "num_players": 2,
+    "hero_position": "BB",
+    "hero_cards": [
+      "2c"
+    ],
+    "stacks_bb": {
+      "BB": 4.0,
+      "BTN": 0.0
+    },
+    "pot_bb": 10.0,
+    "action_history": [
+      {
+        "player": "BTN",
+        "action": "Raise to 5.0BB"
+      }
+    ],
+    "active_players": [
+      "BB",
+      "BTN"
+    ],
+    "current_player": "BB",
+    "gto_strategy": {
+      "Fold": 0.9999999900009999
+    },
+    "tags": [
+      "round_0",
+      "preflop",
+      "facing_raise",
+      "large_pot"
+    ],
+    "hand_category": "unknown",
+    "info_state_str": "[Round 0][Player: 0][Pot: 1000][Money: 400 0][Private: 2c][Public: ][Sequences: r500]"
+  },
+  {
+    "problem_id": "2p_preflop_00005",
+    "num_players": 2,
+    "hero_position": "BB",
+    "hero_cards": [
+      "2c"
+    ],
+    "stacks_bb": {
+      "BB": 4.0,
+      "BTN": 3.0
+    },
+    "pot_bb": 4.0,
+    "action_history": [
+      {
+        "player": "BTN",
+        "action": "Raise to 2.0BB"
+      }
+    ],
+    "active_players": [
+      "BB",
+      "BTN"
+    ],
+    "current_player": "BB",
+    "gto_strategy": {
+      "Call/Check": 0.9406413958044861,
+      "Bet/Raise (Pot)": 0.059356400464808196
+    },
+    "tags": [
+      "round_0",
+      "preflop",
+      "facing_raise"
+    ],
+    "hand_category": "unknown",
+    "info_state_str": "[Round 0][Player: 0][Pot: 400][Money: 400 300][Private: 2c][Public: ][Sequences: r200]"
+  },
+  {
+    "problem_id": "2p_preflop_00006",
+    "num_players": 2,
+    "hero_position": "BB",
+    "hero_cards": [
+      "2d"
+    ],
+    "stacks_bb": {
+      "BB": 4.0,
+      "BTN": 4.0
+    },
+    "pot_bb": 2.0,
+    "action_history": [
+      {
+        "player": "BTN",
+        "action": "Call"
+      }
+    ],
+    "active_players": [
+      "BB",
+      "BTN"
+    ],
+    "current_player": "BB",
+    "gto_strategy": {
+      "Call/Check": 0.6491369638283787,
+      "Bet/Raise (Small)": 0.014015018471475063,
+      "Bet/Raise (Pot)": 0.3368479289516325
+    },
+    "tags": [
+      "round_0",
+      "preflop",
+      "close_decision",
+      "small_pot"
+    ],
+    "hand_category": "unknown",
+    "info_state_str": "[Round 0][Player: 0][Pot: 200][Money: 400 400][Private: 2d][Public: ][Sequences: c]"
+  },
+  {
+    "problem_id": "2p_preflop_00007",
+    "num_players": 2,
+    "hero_position": "BB",
+    "hero_cards": [
+      "2d"
+    ],
+    "stacks_bb": {
+      "BB": 2.0,
+      "BTN": 0.0
+    },
+    "pot_bb": 10.0,
+    "action_history": [
+      {
+        "player": "BTN",
+        "action": "Call"
+      },
+      {
+        "player": "BB",
+        "action": "Raise to 3.0BB"
+      },
+      {
+        "player": "BTN",
+        "action": "Raise to 5.0BB"
+      }
+    ],
+    "active_players": [
+      "BB",
+      "BTN"
+    ],
+    "current_player": "BB",
+    "gto_strategy": {
+      "Call/Check": 0.9999998216377645
+    },
+    "tags": [
+      "round_0",
+      "preflop",
+      "facing_raise",
+      "large_pot"
+    ],
+    "hand_category": "unknown",
+    "info_state_str": "[Round 0][Player: 0][Pot: 1000][Money: 200 0][Private: 2d][Public: ][Sequences: cr300r500]"
+  },
+  {
+    "problem_id": "2p_preflop_00008",
+    "num_players": 2,
+    "hero_position": "BB",
+    "hero_cards": [
+      "2d"
+    ],
+    "stacks_bb": {
+      "BB": 3.0,
+      "BTN": 0.0
+    },
+    "pot_bb": 10.0,
+    "action_history": [
+      {
+        "player": "BTN",
+        "action": "Call"
+      },
+      {
+        "player": "BB",
+        "action": "Raise to 2.0BB"
+      },
+      {
+        "player": "BTN",
+        "action": "Raise to 5.0BB"
+      }
+    ],
+    "active_players": [
+      "BB",
+      "BTN"
+    ],
+    "current_player": "BB",
+    "gto_strategy": {
+      "Fold": 0.9020872928773966,
+      "Call/Check": 0.09791270712260328
+    },
+    "tags": [
+      "round_0",
+      "preflop",
+      "facing_raise",
+      "large_pot"
+    ],
+    "hand_category": "unknown",
+    "info_state_str": "[Round 0][Player: 0][Pot: 1000][Money: 300 0][Private: 2d][Public: ][Sequences: cr200r500]"
+  },
+  {
+    "problem_id": "2p_preflop_00009",
+    "num_players": 2,
+    "hero_position": "BB",
+    "hero_cards": [
+      "2d"
+    ],
+    "stacks_bb": {
+      "BB": 4.0,
+      "BTN": 2.0
+    },
+    "pot_bb": 6.0,
+    "action_history": [
+      {
+        "player": "BTN",
+        "action": "Raise to 3.0BB"
+      }
+    ],
+    "active_players": [
+      "BB",
+      "BTN"
+    ],
+    "current_player": "BB",
+    "gto_strategy": {
+      "Fold": 0.9999996153022025
+    },
+    "tags": [
+      "round_0",
+      "preflop",
+      "facing_raise"
+    ],
+    "hand_category": "unknown",
+    "info_state_str": "[Round 0][Player: 0][Pot: 600][Money: 400 200][Private: 2d][Public: ][Sequences: r300]"
+  }
+]

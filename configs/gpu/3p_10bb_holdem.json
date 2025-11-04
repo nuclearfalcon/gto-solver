@@ -1,0 +1,21 @@
+{
+  "num_players": 3,
+  "stacks": [
+    1000.0,
+    1000.0,
+    1000.0
+  ],
+  "blinds": [
+    50.0,
+    100.0,
+    0.0
+  ],
+  "batch_size": 100,
+  "num_buckets": 10000,
+  "num_hand_buckets": 200,
+  "num_pot_buckets": 10,
+  "num_actions": 4,
+  "seed": 42,
+  "name": "3p_10bb_holdem",
+  "description": "3-player 10BB Hold'em"
+}

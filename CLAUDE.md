@@ -436,3 +436,4 @@ configs/                    # Game configurations (JSON)
 - OpenSpiel source: `/home/nuclearfalcon/open_spiel/open_spiel/games/universal_poker/`
 - Architecture documentation: `ARCHITECTURE.md` (comprehensive SSOT guide)
 - Solving guide: `SOLVING_GUIDE.md` (if exists)
+- don't use `.` in file names for sub-phases, use `-`

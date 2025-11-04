@@ -162,18 +162,19 @@ def sample_trajectory_fixed_length(
         def sample_action_fn(state, key):
             player = state.acting_player
             legal = legal_actions(state)
-            infoset = state_to_infoset(state, player)
-            action_probs = policy_fn(infoset, legal)
 
-            # Sample legal action
+            # JAX-compatible: Use policy_fn that works with just legal mask
+            # For uniform policy: action_probs = legal / sum(legal)
+            # This avoids calling state_to_infoset() which uses Python strings
+            action_probs = policy_fn(None, legal)  # Pass None for infoset
+
+            # Sample legal action using categorical distribution
+            # JAX-friendly: no boolean indexing or dynamic slicing
             key, subkey = random.split(key)
-            legal_indices = jnp.where(legal, jnp.arange(4), -1)
-            legal_indices = legal_indices[legal_indices >= 0]
-            legal_probs = action_probs[legal]
-            legal_probs = legal_probs / (jnp.sum(legal_probs) + 1e-10)
-
-            action_idx = random.choice(subkey, len(legal_indices), p=legal_probs)
-            action = legal_indices[action_idx]
+            # Normalize probabilities (already masked by legal actions)
+            probs = action_probs / (jnp.sum(action_probs) + 1e-10)
+            # Sample directly from action space [0, 1, 2, 3]
+            action = random.choice(subkey, jnp.arange(4), p=probs)
 
             return action, key
 
@@ -191,14 +192,21 @@ def sample_trajectory_fixed_length(
 
         # Record state info (before applying action)
         player = state.acting_player
-        hole_cards = state.hole_cards[player] if player >= 0 else jnp.array([-1, -1])
+        # JAX-compatible: use jnp.where instead of Python if-else
+        # If player < 0 (terminal/chance), use [-1, -1] placeholder
+        hole_cards = jnp.where(
+            player >= 0,
+            state.hole_cards[jnp.maximum(player, 0)],  # Use max(player, 0) to avoid negative indexing
+            jnp.array([-1, -1], dtype=jnp.int32)
+        )
         board = state.board
         bets = state.bets
 
         # Apply action (or no-op if done)
         def apply_action_fn(state, action, key):
             key, subkey = random.split(key)
-            return apply_action(state, int(action), subkey)
+            # Pass action directly - apply_action handles JAX arrays
+            return apply_action(state, action, subkey)
 
         def keep_state_fn(state, action, key):
             return state

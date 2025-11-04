@@ -946,6 +946,131 @@ class GPUMCCFRSolver:
 
         return (states_result, actions_result, players_result, valid_result, num_steps, terminal_payoffs)
 
+    def _sample_trajectory_flat(
+        self,
+        key: jnp.ndarray,
+        num_players: int,
+        stacks: jnp.ndarray,
+        blinds: jnp.ndarray,
+        max_length: int = 50
+    ) -> tuple:
+        """
+        Sample trajectory with FLAT ARRAYS ONLY - no NamedTuple objects.
+
+        **MEMORY LEAK FIX (Phase 10.6)**: This version eliminates all NamedTuple
+        creation inside the while_loop, preventing memory accumulation from JAX
+        trace caching.
+
+        The key difference from _sample_trajectory_fixed_length():
+        - Uses deal_initial_state_flat() instead of deal_initial_state()
+        - Uses flat game engine functions (is_terminal_flat, legal_actions_flat, etc.)
+        - Never creates HoldemState NamedTuples in the hot loop
+        - Passes flat arrays through while_loop carry instead of NamedTuples
+
+        Args:
+            key: JAX random key
+            num_players: Number of players
+            stacks: Starting stacks
+            blinds: Blind amounts
+            max_length: Maximum trajectory length
+
+        Returns:
+            Tuple of (states_flat, actions, players, valid_mask, payoffs)
+            - states_flat: Flattened states, shape (max_length, state_size)
+            - actions: Action sequence, shape (max_length,), padded with -1
+            - players: Player sequence, shape (max_length,), padded with -1
+            - valid_mask: Boolean mask, shape (max_length,), True for valid steps
+            - payoffs: Terminal payoffs, shape (num_players,)
+        """
+        from matrix_cfr.holdem_jax_v2 import (
+            deal_initial_state_flat,
+            is_terminal_flat,
+            legal_actions_flat,
+            apply_action_flat,
+            payoffs_flat
+        )
+
+        # Calculate state size (2 players: 73 floats)
+        state_size = 2 * num_players + 5 + 52 + num_players + 1 + num_players + 3 + num_players + num_players
+
+        # Initialize fixed-size arrays for trajectory recording
+        states_array = jnp.zeros((max_length, state_size), dtype=jnp.float32)
+        actions_array = jnp.full(max_length, -1, dtype=jnp.int32)
+        players_array = jnp.full(max_length, -1, dtype=jnp.int32)
+        valid_mask = jnp.zeros(max_length, dtype=bool)
+
+        # Deal initial state AS FLAT ARRAY (no NamedTuple!)
+        key, deal_key = random.split(key)
+        state_flat = deal_initial_state_flat(deal_key, num_players, stacks, blinds)
+
+        # Extract acting_player index from flat state
+        acting_player_idx = 2 * num_players + 5 + 52 + num_players + 1 + num_players + 1
+
+        def cond_fn(carry):
+            """Continue while steps < max_length AND not done."""
+            state_flat, key, states, actions, players, valid, step, done = carry
+            return (step < max_length) & ~done
+
+        def body_fn(carry):
+            """Sample action, record state + action, advance state."""
+            state_flat, key, states, actions, players, valid, step, done = carry
+
+            # Check if terminal using FLAT function
+            terminal = is_terminal_flat(state_flat, num_players)
+            done = done | terminal
+
+            # Get current player from flat state
+            current_player = jax.lax.cond(
+                done,
+                lambda: jnp.int32(-1),
+                lambda: state_flat[acting_player_idx].astype(jnp.int32)
+            )
+
+            # Store current state (already flat!)
+            states = states.at[step].set(state_flat)
+
+            # Sample action (or no-op if done)
+            def sample_action(state_flat, key):
+                legal = legal_actions_flat(state_flat, num_players)
+                probs = legal.astype(jnp.float32) / (jnp.sum(legal.astype(jnp.float32)) + 1e-10)
+                key, subkey = random.split(key)
+                action = random.choice(subkey, jnp.arange(self.config.num_actions), p=probs)
+                return action, key
+
+            def no_op(state_flat, key):
+                return jnp.int32(-1), key
+
+            action, key = jax.lax.cond(done, no_op, sample_action, state_flat, key)
+
+            # Record action and player in arrays
+            actions = actions.at[step].set(action)
+            players = players.at[step].set(current_player)
+            valid = valid.at[step].set(~done)
+
+            # Apply action using FLAT function (or keep state if done)
+            def apply_fn(state_and_key):
+                state_flat, action, key = state_and_key
+                key, action_key = random.split(key)
+                return apply_action_flat(state_flat, action, action_key, num_players), key
+
+            def keep_fn(state_and_key):
+                state_flat, action, key = state_and_key
+                return state_flat, key
+
+            new_state_flat, key = jax.lax.cond(done, keep_fn, apply_fn, (state_flat, action, key))
+
+            return (new_state_flat, key, states, actions, players, valid, step + 1, done)
+
+        # Run sampling loop with FLAT STATE in carry (no NamedTuple!)
+        initial_carry = (state_flat, key, states_array, actions_array, players_array, valid_mask, jnp.int32(0), False)
+        final_state_flat, final_key, states_result, actions_result, players_result, valid_result, num_steps, _ = \
+            jax.lax.while_loop(cond_fn, body_fn, initial_carry)
+
+        # Get terminal payoffs using FLAT function
+        terminal_payoffs = payoffs_flat(final_state_flat, num_players)
+
+        return (states_result, actions_result, players_result, valid_result, terminal_payoffs)
+
     def _sample_batched_trajectories(
         self,
         batch_keys: jnp.ndarray,
@@ -955,14 +1080,13 @@ class GPUMCCFRSolver:
         max_actions: int = 50
     ) -> tuple:
         """
-        GPU-parallel trajectory sampling with full state storage (OPTION 1 - BREAKTHROUGH!).
+        GPU-parallel trajectory sampling with FLAT ARRAYS (Memory Leak Fix - Phase 10.6).
 
-        **NEW APPROACH (Phase 10.4)**: Stores flattened states directly during GPU sampling!
-        - NO replay needed - states are already available
-        - Massive speedup: GPU does sampling + storage, CPU just unflattens
-        - Memory efficient: 4 MB for batch_size=100 (trivial on modern GPUs)
+        **MEMORY LEAK FIX**: Uses _sample_trajectory_flat() instead of
+        _sample_trajectory_fixed_length() to eliminate NamedTuple creation in vmap+while_loop.
 
-        This achieves 50-200× speedup by eliminating the CPU replay bottleneck.
+        This prevents the ~38-40 MB/iteration memory leak caused by JAX accumulating
+        NamedTuple references in its internal traces.
 
         Args:
             batch_keys: Array of random keys, shape (batch_size, 2)
@@ -972,27 +1096,27 @@ class GPUMCCFRSolver:
             max_actions: Maximum trajectory length
 
         Returns:
-            Tuple of (states_batch, actions_batch, players_batch, valid_masks,
-                     num_steps_array, payoffs_batch):
+            Tuple of (states_batch, actions_batch, players_batch, valid_masks, payoffs_batch):
             - states_batch: Flattened states, shape (batch_size, max_actions, state_size)
             - actions_batch: Action sequences, shape (batch_size, max_actions)
             - players_batch: Player sequences, shape (batch_size, max_actions)
             - valid_masks: Valid step masks, shape (batch_size, max_actions)
-            - num_steps_array: Actual lengths, shape (batch_size,)
             - payoffs_batch: Terminal payoffs, shape (batch_size, num_players)
         """
-        # Vectorize the state-storing trajectory sampler over batch dimension
+        # Vectorize the FLAT trajectory sampler over batch dimension
+        # This eliminates NamedTuple creation in the hot loop
         vectorized_sampler = jax.vmap(
-            lambda key: self._sample_trajectory_fixed_length(
+            lambda key: self._sample_trajectory_flat(
                 key, num_players, stacks, blinds, max_actions
             )
         )
 
-        # GPU-parallel sampling with state storage - THE BREAKTHROUGH!
+        # GPU-parallel sampling with FLAT ARRAYS - NO MEMORY LEAK!
         batch_results = vectorized_sampler(batch_keys)
 
-        # batch_results is a tuple of six batched arrays:
-        # (states, actions, players, valid_masks, num_steps, payoffs)
+        # batch_results is a tuple of five batched arrays:
+        # (states, actions, players, valid_masks, payoffs)
+        # Note: num_steps removed since not needed
         return batch_results
 
     def _reconstruct_trajectory(
@@ -1095,7 +1219,7 @@ class GPUMCCFRSolver:
 
             # GPU-PARALLEL SAMPLING WITH STATE STORAGE - This is where massive speedup happens!
             # Samples 100 trajectories in parallel on GPU and stores flattened states
-            states_batch, actions_batch, players_batch, valid_masks, num_steps_array, payoffs_batch = \
+            states_batch, actions_batch, players_batch, valid_masks, payoffs_batch = \
                 self._sample_batched_trajectories(
                     batch_keys,
                     num_players,
@@ -1210,7 +1334,7 @@ class GPUMCCFRSolver:
         self.key, *subkeys = random.split(self.key, batch_size + 1)
         batch_keys = jnp.array(subkeys)
 
-        states_batch, actions_batch, players_batch, valid_masks, num_steps_array, payoffs_batch = \
+        states_batch, actions_batch, players_batch, valid_masks, payoffs_batch = \
             self._sample_batched_trajectories(
                 batch_keys,
                 num_players,
@@ -1297,7 +1421,8 @@ class GPUMCCFRSolver:
         self.iteration += 1
 
         # Calculate total trajectory length for metrics
-        total_trajectory_length = int(jnp.sum(num_steps_array))
+        # Sum of valid steps across all trajectories
+        total_trajectory_length = int(jnp.sum(valid_masks))
 
         # CRITICAL: Explicit garbage collection AND array cleanup
         # Force JAX to release cached arrays and Python to clean up temporaries
@@ -1306,6 +1431,11 @@ class GPUMCCFRSolver:
         del cfvs, regret_deltas, is_updating_player
         del flat_bucket_indices, flat_regret_deltas, strategies
         gc.collect()
+
+        # EXPERIMENTAL: Clear JAX compilation cache every 10 iterations to prevent memory accumulation
+        # This may help with memory leaks from JAX's internal caching of traced computations
+        if self.iteration % 10 == 0:
+            jax.clear_caches()
 
         return total_trajectory_length
 

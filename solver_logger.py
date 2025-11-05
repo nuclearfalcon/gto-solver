@@ -139,6 +139,59 @@ class SolverLogger:
         message = " ".join(parts)
         self._log_and_flush(message)
 
+    def log_progress_table(
+        self,
+        iteration: int,
+        time_elapsed: float,
+        iters_per_sec: float,
+        memory_mb: float,
+        next_checkpoint: int,
+        best_exploitability: float,
+        checkpoint_interval: Optional[int] = None
+    ):
+        """
+        Log progress update in a clean table format.
+
+        Args:
+            iteration: Current iteration
+            time_elapsed: Time elapsed in seconds
+            iters_per_sec: Iterations per second
+            memory_mb: Memory usage in MB
+            next_checkpoint: Next checkpoint iteration
+            best_exploitability: Best (lowest) exploitability seen so far
+            checkpoint_interval: Checkpoint interval (for ETA calculation)
+        """
+        # Calculate ETA to next checkpoint
+        if checkpoint_interval and iters_per_sec > 0:
+            iters_remaining = next_checkpoint - iteration
+            eta_seconds = iters_remaining / iters_per_sec
+            eta_str = format_time(eta_seconds)
+        else:
+            eta_str = "N/A"
+
+        # Format time and memory
+        time_str = format_time(time_elapsed)
+        mem_str = format_memory(memory_mb)
+
+        # Format exploitability
+        if best_exploitability == float('inf'):
+            exploit_str = "Not yet calc"
+        else:
+            exploit_str = f"{best_exploitability:.6f}"
+
+        # Print table
+        self._log_and_flush("")
+        self._log_and_flush("┌" + "─" * 78 + "┐")
+        self._log_and_flush(f"│ {'Progress':<20} │ {iteration:>12,} / {self.max_iterations:<12,} {' ':>14} │")
+        self._log_and_flush(f"│ {'Iterations/sec':<20} │ {iters_per_sec:>12.1f} {' ':>28} │")
+        self._log_and_flush(f"│ {'Best Exploitability':<20} │ {exploit_str:>12} {' ':>28} │")
+        self._log_and_flush(f"│ {'Time Elapsed':<20} │ {time_str:>12} {' ':>28} │")
+        self._log_and_flush(f"│ {'Memory Usage':<20} │ {mem_str:>12} {' ':>28} │")
+        self._log_and_flush(f"│ {'Next Checkpoint':<20} │ {next_checkpoint:>12,} {' ':>28} │")
+        self._log_and_flush(f"│ {'ETA to Checkpoint':<20} │ {eta_str:>12} {' ':>28} │")
+        self._log_and_flush("└" + "─" * 78 + "┘")
+        self._log_and_flush("")
+
     def log_progress(
         self,
         iteration: int,

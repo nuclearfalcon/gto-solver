@@ -386,27 +386,38 @@ class UnifiedPokerSolver:
         self.logger.log_info(f"Progress updates every {progress_interval:,} iterations")
         self.logger.log_info("")
 
+        # Track best (lowest) exploitability seen so far
+        best_exploitability = last_exploitability if not skip_initial_exploitability else float('inf')
+
         # Main solving loop
         while self.current_iteration < max_iterations:
             # Run iteration
             self._run_iteration()
 
-            # Show progress update (without calculating exploitability)
-            if self.current_iteration % progress_interval == 0:
+            # Show progress update after FIRST iteration and then every progress_interval
+            if self.current_iteration == 1 or self.current_iteration % progress_interval == 0:
                 # Calculate current stats without exploitability
                 elapsed = time.time() - self.metrics_tracker.start_time
                 iters_per_sec = self.current_iteration / elapsed if elapsed > 0 else 0
                 memory_mb = self.metrics_tracker.process.memory_info().rss / (1024 * 1024)
-                next_check = adaptive_schedule.get_next_check(self.current_iteration)
 
-                # Log progress with last known exploitability
-                self.logger.log_progress_simple(
+                # Determine next checkpoint (exploitability check or save checkpoint)
+                next_exploit_check = adaptive_schedule.get_next_check(self.current_iteration)
+                if checkpoint_interval:
+                    next_save_checkpoint = ((self.current_iteration // checkpoint_interval) + 1) * checkpoint_interval
+                    next_checkpoint = min(next_exploit_check, next_save_checkpoint)
+                else:
+                    next_checkpoint = next_exploit_check
+
+                # Log progress table
+                self.logger.log_progress_table(
                     iteration=self.current_iteration,
                     time_elapsed=elapsed,
                     iters_per_sec=iters_per_sec,
                     memory_mb=memory_mb,
-                    next_check=next_check,
-                    last_exploitability=last_exploitability
+                    next_checkpoint=next_checkpoint,
+                    best_exploitability=best_exploitability,
+                    checkpoint_interval=checkpoint_interval
                 )
 
                 # Memory management
@@ -435,6 +446,10 @@ class UnifiedPokerSolver:
                     exploitability_value = self.calculate_exploitability()
 
                 last_exploitability = exploitability_value
+
+                # Update best exploitability if this is lower
+                if exploitability_value < best_exploitability:
+                    best_exploitability = exploitability_value
 
                 # Record metrics
                 self.metrics_tracker.record_checkpoint(

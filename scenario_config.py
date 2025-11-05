@@ -96,15 +96,27 @@ def parse_cards(cards_str: str) -> List[int]:
 
     Args:
         cards_str: Space-separated cards like "As Kh" or "2h 2d"
+                   Can also be raw card integers like "5" or "0 3"
 
     Returns:
         List of card integers
 
     Example:
         "As Kh" -> [51, 47]
+        "5" -> [5]
+        "0 3" -> [0, 3]
     """
     card_strings = cards_str.strip().split()
-    return [card_string_to_int(c) for c in card_strings]
+    result = []
+    for c in card_strings:
+        # Try to parse as integer first (for tiny decks)
+        try:
+            card_int = int(c)
+            result.append(card_int)
+        except ValueError:
+            # Not an integer, try standard notation
+            result.append(card_string_to_int(c))
+    return result
 
 
 @dataclass

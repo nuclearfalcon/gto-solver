@@ -1,0 +1,12 @@
+{
+  "algorithm": "Python CFR+",
+  "game_description": "PokerGameConfig(2p, 2.0BB, fcpa)",
+  "total_iterations": 400,
+  "total_time": 0.8763465881347656,
+  "final_exploitability": 7.261706210946729,
+  "initial_exploitability": 7.261706210946729,
+  "min_exploitability": 7.261706210946729,
+  "avg_iters_per_sec": 456.44041457543454,
+  "peak_memory_mb": 109.15625,
+  "num_checkpoints": 1
+}

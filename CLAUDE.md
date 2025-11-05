@@ -51,6 +51,17 @@ python solve_and_compare.py --config configs/2p_10bb_fcpa.json --iterations 5000
 python query_policy.py --policy results/cfr_plus_policy.pkl --config configs/2p_10bb_fcpa.json
 ```
 
+**Query conditional best response for specific hero scenarios:**
+```bash
+# Analyze hero's optimal strategy with specific hole cards
+python query_scenario.py --policy checkpoints/cfr_plus_iter_200.pkl \
+    --config configs/2p_5bb_fcpa.json \
+    --hero-position 0 \
+    --hero-cards "As Kh" \
+    --depth-limit 1 \
+    --max-samples 500
+```
+
 **Plot results:**
 ```bash
 python plot_results.py results/cfr_plus_metrics.csv results/external_mccfr_metrics.csv
@@ -210,6 +221,56 @@ result = calc.calculate(
 - Final measurement: uses 0.5% CI width target with 500-5000 samples (high accuracy, ~20-50 min)
 - Each sample requires computing exact best response for one random card deal
 
+### Conditional Best Response (Hero Scenario Analysis)
+
+**Purpose:** Analyze hero's optimal strategy with specific hole cards against GTO opponents, without solving the entire game tree.
+
+```python
+from conditional_solver import ConditionalBestResponse
+from scenario_config import ScenarioConfig
+
+# Define scenario: hero with specific cards
+scenario = ScenarioConfig.from_game_config(
+    game_config=config,
+    hero_position=0,              # Button = 0, BB = 1
+    hero_cards_str="As Kh",       # Hero's specific cards
+    depth_limit=1                 # 1 = preflop only, None = all streets
+)
+
+# Compute conditional best response
+cbr = ConditionalBestResponse(game, policy, scenario)
+result = cbr.compute(
+    num_samples=500,              # Max opponent card deals to sample
+    confidence_level=0.99,        # 99% CI
+    max_ci_width=0.05,           # Stop when CI width < 5%
+    verbose=True
+)
+
+# Results
+print(f"Best action: {result['best_action']}")
+print(f"Action EVs: {result['action_evs']}")
+print(f"BR value: {result['br_value']} ± {result['ci_half_width']}")
+```
+
+**Key features:**
+- Monte Carlo sampling over opponent hand ranges
+- Samples only opponent cards, hero cards are fixed
+- Computes best response for each opponent card deal
+- Depth-limited solving (preflop only, or any N streets)
+- Streaming statistics with confidence intervals
+- Memory-safe (same approach as sampled exploitability)
+
+**Use cases:**
+- Analyzing specific hero scenarios (e.g., "What should I do with AK on BTN?")
+- Range analysis and action frequencies
+- Debugging/validating trained policies on specific hands
+- Training data generation for neural networks
+
+**Card notation:**
+- Standard notation: "As Kh" (Ace of spades, King of hearts)
+- Raw integers: "51 47" (for tiny decks with non-standard ranks/suits)
+- Parser tries integer first, then falls back to standard notation
+
 ### Game Configuration Pattern
 
 **Always use `PokerGameConfig` for consistency:**
@@ -340,12 +401,15 @@ There is **no separate ante parameter**. Simulate antes using the `blind` parame
 - `solve_poker.py` - Single algorithm solver with checkpointing and metrics
 - `solve_and_compare.py` - Compare multiple CFR algorithms side-by-side
 - `query_policy.py` - Interactive policy queries for trained models
+- `query_scenario.py` - Conditional best response analysis for specific hero scenarios
 - `plot_results.py` - Visualize convergence curves
 
 **Core Modules (SSOT):**
 - `poker_solver.py` - Unified solver interface
 - `exploitability_metrics.py` - Sampled exploitability calculation
 - `game_config.py` - Game configuration management
+- `scenario_config.py` - Hero scenario configuration for conditional solving
+- `conditional_solver.py` - Conditional best response calculator
 - `solver_metrics.py` - Metrics tracking and adaptive schedules
 - `solver_logger.py` - Standardized logging
 - `test_utils.py` - Test utilities (memory monitoring, etc.)
